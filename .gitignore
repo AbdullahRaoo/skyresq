@@ -1,0 +1,13 @@
+# ROS 2
+install/
+build/
+log/
+*.log
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+# OS
+.DS_Store
+.vscode/
