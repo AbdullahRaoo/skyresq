@@ -1,45 +1,37 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
     
-    # Bridge configuration
-    # Mapping: Gazebo Topic -> ROS Topic
-    # We assume the drone camera publishes to /camera inside Gazebo
-    bridge_config = """
-    - topic: /camera/image_raw
-      ros_type_name: sensor_msgs/msg/Image
-      gz_type_name: gz.msgs.Image
-      direction: GZ_TO_ROS
-    - topic: /cmd_vel
-      ros_type_name: geometry_msgs/msg/Twist
-      gz_type_name: gz.msgs.Twist
-      direction: ROS_TO_GZ
-    """
-
-    # Start Gazebo
-    # For now, we launch an empty world or a sensor world. 
-    # In next session, this will link to PX4 SITL.
-    gz_sim = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')
-        ),
-        launch_arguments={'gz_args': '-r empty.sdf'}.items(),
+    # PX4 Execution Command
+    # Runs the specific target built earlier
+    px4_dir = os.path.expanduser('~/Drone/PX4-Autopilot')
+    px4_cmd = ExecuteProcess(
+        cmd=['make', 'px4_sitl', 'gz_x500'],
+        cwd=px4_dir,
+        output='screen'
     )
 
     # ROS-Gazebo Bridge
+    # Detailed bridge for Camera + Control + Odometry
+    # GZ_TO_ROS: Camera, Odom, Battery
+    # ROS_TO_GZ: cmd_vel
     bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        parameters=[{'config_file': ''}], # We could use a file, or separate args
         arguments=[
+            # Camera
             '/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image',
-            '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist'
+            # Control (cmd_vel -> Twist)
+            '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
+            # Odometry (Ground Truth)
+            '/model/x500/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry',
+            # Battery/Status
+            '/model/x500/battery/0/state@sensor_msgs/msg/BatteryState[gz.msgs.BatteryState'
         ],
         output='screen'
     )
@@ -53,7 +45,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        gz_sim,
+        px4_cmd,
         bridge,
         detector
     ])

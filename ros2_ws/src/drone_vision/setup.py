@@ -27,7 +27,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'person_detector = drone_vision.person_detector:main'
+            'person_detector = drone_vision.person_detector:main',
+            'mission_node = drone_vision.mission_node:main'
         ],
     },
 )
