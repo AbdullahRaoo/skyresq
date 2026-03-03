@@ -3,11 +3,17 @@ install/
 build/
 log/
 *.log
+
+# PX4 and Simulation Environment
+PX4-Autopilot/
+Micro-XRCE-DDS-Agent/
+
 # Python
 venv/
 __pycache__/
 *.py[cod]
 *$py.class
+
 # OS
 .DS_Store
 .vscode/

@@ -43,18 +43,21 @@ class MissionNode(Node):
         self.px4_connected = False
         self.armed = False
         self.offboard_mode = False
+        self.takeoff_complete = False
+        self.mission_completed = False
         
         # Mission parameters
         self.takeoff_height = -5.0  # NED (negative = up)
         self.square_size = 10.0
         
         # Waypoints (NED: X=North, Y=East, Z=Down)
+        # Start with takeoff, then fly square, return home
         self.waypoints = [
-            [0.0, 0.0, self.takeoff_height],                    # Takeoff
-            [self.square_size, 0.0, self.takeoff_height],       # North
-            [self.square_size, self.square_size, self.takeoff_height],  # North-East
-            [0.0, self.square_size, self.takeoff_height],       # East
-            [0.0, 0.0, self.takeoff_height],                    # Home
+            [0.0, 0.0, self.takeoff_height],                    # WP0: Takeoff (hover above origin)
+            [self.square_size, 0.0, self.takeoff_height],       # WP1: North
+            [self.square_size, self.square_size, self.takeoff_height],  # WP2: North-East
+            [0.0, self.square_size, self.takeoff_height],       # WP3: East
+            [0.0, 0.0, self.takeoff_height],                    # WP4: Home
         ]
         self.current_waypoint = 0
         self.waypoint_threshold = 1.5  # meters
@@ -134,7 +137,7 @@ class MissionNode(Node):
         self.trajectory_setpoint_pub.publish(msg)
 
     def distance_to_waypoint(self, waypoint):
-        """Calculate distance from current position to waypoint"""
+        """Calculate 3D distance from current position to waypoint"""
         if self.vehicle_local_position is None:
             return float('inf')
         dx = self.vehicle_local_position.x - waypoint[0]
@@ -148,11 +151,15 @@ class MissionNode(Node):
         # === PHASE 0: Wait for PX4 connection ===
         if not self.px4_connected:
             return  # Do nothing until connected
+
+        # === Mission already done, just keep heartbeat ===
+        if self.mission_completed:
+            return
         
         # === Always publish offboard heartbeat ===
         self.publish_offboard_control_mode()
         
-        # Get current waypoint
+        # Get current waypoint target
         if self.current_waypoint < len(self.waypoints):
             target = self.waypoints[self.current_waypoint]
             self.publish_trajectory_setpoint(target[0], target[1], target[2])
@@ -171,18 +178,33 @@ class MissionNode(Node):
             self.arm()
             return
         
-        # === PHASE 3: Flying the mission ===
+        # === PHASE 3: Wait for takeoff altitude ===
+        if not self.takeoff_complete:
+            if self.vehicle_local_position is not None:
+                # Check if drone reached takeoff altitude (z is negative in NED)
+                current_alt = self.vehicle_local_position.z
+                if current_alt < self.takeoff_height + 0.5:  # within 0.5m of target
+                    self.takeoff_complete = True
+                    self.current_waypoint = 1  # Skip WP0 (takeoff), start flying square
+                    self.get_logger().info(
+                        f"Takeoff complete! Alt: {current_alt:.1f}m. Starting square mission.")
+            return
+
+        # === PHASE 4: Flying the mission waypoints ===
         if self.current_waypoint < len(self.waypoints):
             target = self.waypoints[self.current_waypoint]
             dist = self.distance_to_waypoint(target)
             
             if dist < self.waypoint_threshold:
-                self.get_logger().info(f"Reached waypoint {self.current_waypoint}: {target}")
+                self.get_logger().info(
+                    f"Reached waypoint {self.current_waypoint}: "
+                    f"[{target[0]:.0f}, {target[1]:.0f}, {target[2]:.0f}] (dist: {dist:.1f}m)")
                 self.current_waypoint += 1
         else:
-            # Mission complete
+            # Mission complete — land once
             self.land()
-            self.get_logger().info("Mission Complete - Landing")
+            self.get_logger().info("Mission Complete - Landing!")
+            self.mission_completed = True
 
 
 def main(args=None):
