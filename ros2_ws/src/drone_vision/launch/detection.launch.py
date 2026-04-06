@@ -1,51 +1,93 @@
+#!/usr/bin/env python3
+"""
+Detection Launch File
+---------------------
+Launches the Gazebo camera -> ROS 2 bridge + the YOLO26 person detector.
+
+Prerequisites:
+  - PX4 SITL must be running with x500_mono_cam model:
+      export GZ_SIM_RESOURCE_PATH=...  (or source gz_env.sh)
+      cd ~/Drone/PX4-Autopilot && make px4_sitl gz_x500_mono_cam
+  - MicroXRCEAgent must be running:
+      MicroXRCEAgent udp4 -p 8888
+"""
 import os
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription
-from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
+
+# Path to the YAML config for ros_gz_bridge
+BRIDGE_CONFIG = os.path.join(
+    os.path.expanduser('~/Drone/ros2_ws/src/drone_vision/config'),
+    'gz_bridge.yaml'
+)
+
+# venv site-packages path — injected ONLY into the detector process,
+# NOT globally, so Qt-dependent tools (rqt, rviz) in other terminals
+# are never affected.
+VENV_SITE = os.path.expanduser('~/Drone/venv/lib/python3.12/site-packages')
+
 
 def generate_launch_description():
-    
-    # PX4 Execution Command
-    # Runs the specific target built earlier
-    px4_dir = os.path.expanduser('~/Drone/PX4-Autopilot')
-    px4_cmd = ExecuteProcess(
-        cmd=['make', 'px4_sitl', 'gz_x500'],
-        cwd=px4_dir,
-        output='screen'
-    )
+    # === Arguments ===
+    conf_arg = DeclareLaunchArgument(
+        'confidence', default_value='0.45',
+        description='YOLO26 confidence threshold')
 
-    # ROS-Gazebo Bridge
-    # Detailed bridge for Camera + Control + Odometry
-    # GZ_TO_ROS: Camera, Odom, Battery
-    # ROS_TO_GZ: cmd_vel
-    bridge = Node(
+    mode_arg = DeclareLaunchArgument(
+        'mode', default_value='search',
+        description="Mission mode: 'square' (test) or 'search' (follow targets)")
+
+    # === Gazebo -> ROS 2 Camera Bridge (YAML config) ===
+    # No venv injection needed — pure ROS node.
+    gz_bridge = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        arguments=[
-            # Camera
-            '/camera/image_raw@sensor_msgs/msg/Image[gz.msgs.Image',
-            # Control (cmd_vel -> Twist)
-            '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
-            # Odometry (Ground Truth)
-            '/model/x500/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry',
-            # Battery/Status
-            '/model/x500/battery/0/state@sensor_msgs/msg/BatteryState[gz.msgs.BatteryState'
-        ],
-        output='screen'
+        name='gz_camera_bridge',
+        parameters=[{'config_file': BRIDGE_CONFIG}],
+        output='screen',
     )
 
-    # Person Detector Node
+    # === YOLO26 Person Detector ===
+    # venv PYTHONPATH scoped to THIS process only via additional_env.
+    # YOLO_AUTOINSTALL=false prevents ultralytics from calling pip at
+    # startup (PEP-668 protection on managed Ubuntu environments).
+    existing_pp = os.environ.get('PYTHONPATH', '')
+    detector_pythonpath = f"{VENV_SITE}:{existing_pp}" if existing_pp else VENV_SITE
     detector = Node(
         package='drone_vision',
         executable='person_detector',
         name='person_detector',
-        output='screen'
+        parameters=[{
+            'image_topic': '/drone/camera_raw',
+            'confidence_threshold': LaunchConfiguration('confidence'),
+            'process_every_n': 2,
+        }],
+        additional_env={
+            'PYTHONPATH': detector_pythonpath,
+            'YOLO_AUTOINSTALL': 'false',
+            'YOLO_VERBOSE': 'false',
+        },
+        output='screen',
+    )
+
+    # === Mission Controller ===
+    # No venv injection needed — uses only px4_msgs / rclpy.
+    mission = Node(
+        package='drone_vision',
+        executable='mission_node',
+        name='mission_node',
+        parameters=[{
+            'mode': LaunchConfiguration('mode'),
+        }],
+        output='screen',
     )
 
     return LaunchDescription([
-        px4_cmd,
-        bridge,
-        detector
+        conf_arg,
+        mode_arg,
+        gz_bridge,
+        detector,
+        mission,
     ])

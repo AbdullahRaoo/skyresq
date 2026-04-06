@@ -38,21 +38,24 @@ Getting the simulation environment stable was our biggest hurdle. We successfull
 
 ## 📍 What We Are Doing Right Now
 
-We have just finished a clean, successful build of the entire environment (Agent, PX4 Firmware, ROS 2 Workspace). 
+All blockers are **resolved**. The full detection + navigation pipeline is code-complete and ready for SITL testing.
 
-**Current Action**: We are about to execute the **Square Mission verification test** to prove that our ROS 2 `mission_node` can successfully command the PX4 SITL drone in Gazebo.
+**Resolved Issues**:
+1. ✅ YOLO26 ONNX model loads instantly with no warnings (explicit `task='detect'`).
+2. ✅ Ultralytics auto-install hang fixed (`YOLO_AUTOINSTALL=false` set in code + launch files).
+3. ✅ `person_detector.py` subscribes to `/drone/camera_raw` (Gazebo bridge topic) by default.
+4. ✅ `mission_node.py` upgraded with full state machine supporting:
+   - `mode='square'` — legacy test flight (arm → takeoff → square → land).
+   - `mode='search'` — autonomous search & rescue (orbit scan → detect → track → descend → land).
+5. ✅ `detection.launch.py` now launches camera bridge + detector + mission node together.
 
-To run the simulation, we use three terminals:
-1.  **Agent**: `MicroXRCEAgent udp4 -p 8888`
-2.  **Simulation**: `cd ~/Drone/PX4-Autopilot && export GZ_SIM_RESOURCE_PATH="..." && make px4_sitl gz_x500`
-3.  **ROS 2 Node**: `ros2 run drone_vision mission_node`
+**Current Action**: Ready for end-to-end SITL verification.
 
 ---
 
 ## ⏭️ Next Steps
 
-Once the square mission is verified and the drone flies as expected in Gazebo, our next immediate goals are:
-
-1.  **Integrate Vision in SITL**: Launch the Gazebo simulation with a camera-equipped drone model and run the `person_detector.py` node alongside it.
-2.  **Dynamic Navigation**: Modify the `mission_node` to accept coordinate offsets from the `person_detector` node, allowing the drone to actively track and follow a detected person in the simulation.
-3.  **Hardware Preparation**: Begin refining the codebase to ensure it is lightweight and robust enough for deployment on the Raspberry Pi companion computer.
+1.  **End-to-End SITL Verification**: Launch PX4 SITL with `x500_mono_cam`, start the XRCE-DDS agent, and run `ros2 launch drone_vision detection.launch.py` to verify the full pipeline (camera → detection → navigation) works together.
+2.  **Place a Person in Gazebo**: Add a person model to the Gazebo world so the camera can detect it and trigger the TRACK → DESCEND → LAND sequence.
+3.  **Tune Tracking Parameters**: Adjust `tracking_speed`, `search_radius`, `target_confirm_secs` based on SITL behaviour.
+4.  **Hardware Preparation (Raspberry Pi)**: Per the `implementation_plan.md.resolved`, deploy this optimized architecture (ONNX, compressed image transport, headless OS, systemd) to the RPi companion computer.

@@ -1,0 +1,60 @@
+# YOLO26 & Raspberry Pi Optimization Plan
+
+## 🎯 The Objective
+To upgrade our vision pipeline to the newly released **YOLO26** (January 2026), and design an **enterprise-grade, highly optimized architecture** specifically tailored for deployment on a resource-constrained edge device like a **Raspberry Pi (RPi 4 or 5)**.
+
+---
+
+## 🚀 1. Why YOLO26?
+YOLO26 was released by Ultralytics as a massive leap forward for edge devices. Its critical advantage for our Raspberry Pi deployment is:
+*   **NMS-Free Architecture**: Non-Maximum Suppression (NMS) is completely removed, drastically lowering CPU latency.
+*   **CPU Performance**: Up to 43% faster CPU inference than YOLO11/YOLOv8.
+*   **Nano Variant (YOLO26n)**: Extremely lightweight but highly accurate, perfect for a Pi without a dedicated GPU/TPU.
+
+---
+
+## 🏗️ 2. Enterprise-Grade Architecture (The Plan)
+
+When we move from the powerful PC simulation to the Raspberry Pi, we cannot use basic Python scripts subscribing to massive raw image streams. We must build an optimized pipeline.
+
+### A. Model Optimization Layer (NCNN / ONNX)
+We will NOT run raw PyTorch ([.pt](file:///home/abdullah/Drone/yolov8n.pt)) files on the Raspberry Pi. PyTorch is too heavy and slow for edge CPUs.
+*   **Action**: Export `yolo26n.pt` to **NCNN** or **ONNX** format.
+*   **Action**: Apply **INT8 Quantization** during export. This reduces the math precision from 32-bit to 8-bit, speeding up the CPU inference by 3x-4x with almost zero loss in accuracy.
+
+### B. ROS 2 Communication Layer (Image Transport)
+Publishing raw 1080p images (`sensor_msgs/Image`) at 30fps over ROS 2 will instantly saturate the RPi's memory pipeline and cause lag.
+*   **Action**: Use the `image_transport` package.
+*   **Action**: The camera node will publish `sensor_msgs/CompressedImage` (JPEG encoded).
+*   **Action**: The YOLO26 node will subscribe to the compressed topic, decode it once, run inference, and immediately discard the frame to save RAM.
+
+### C. Decoupled Node Structure
+An enterprise system separates concerns so that if one thing fails, the whole drone doesn't crash.
+1.  **`camera_node`**: C++ based (e.g., `v4l2_camera`). Lightweight, interfaces directly with the hardware CSI/USB camera, compresses the image, and publishes it.
+2.  **`vision_node`**: Runs the optimized YOLO26 NCNN/ONNX model. Publishes a lightweight custom message: `TargetPosition` (e.g., center X, center Y, width, height, confidence).
+3.  **`mission_node`**: Listens ONLY to `TargetPosition`. If it loses the vision feed, it enters a fail-safe hover state.
+
+### D. OS and Hardware Optimization (RPi Setup)
+*   **Headless OS**: Ubuntu 24.04 Server (No GUI, frees up ~500MB of RAM).
+*   **Dedicated Cores**: Pin the `vision_node` to 2 specific CPU cores using `taskset` to prevent it from starving the `MicroXRCEAgent` (which handles critical communication with the flight controller).
+*   **Systemd Services**: The entire stack will be launched automatically on boot via systemd services with auto-restart policies. No manual terminals required.
+
+---
+
+## 🗺️ 3. Implementation Roadmap
+
+### Phase 1: Simulation Prep (Current PC)
+1.  Install Ultralytics and upgrade to YOLO26.
+2.  Export `yolo26n.pt` to ONNX format.
+3.  Rewrite [person_detector.py](file:///home/abdullah/Drone/ros2_ws/src/drone_vision/drone_vision/person_detector.py) to use the ONNX model and subscribe to Gazebo's virtual camera.
+4.  Modify [mission_node.py](file:///home/abdullah/Drone/ros2_ws/src/drone_vision/drone_vision/mission_node.py) to accept dynamic setpoints (following the detected bounding box) in Gazebo safely.
+
+### Phase 2: Raspberry Pi Environment Setup
+1.  Flash Ubuntu 24.04 Server onto the RPi.
+2.  Install ROS 2 Jazzy (Barebones/Base install).
+3.  Write the systemd service files for the XRCE-DDS Agent and the ROS 2 Launch file.
+
+### Phase 3: Hardware Integration
+1.  Connect the physical camera and verify the `v4l2_camera` node.
+2.  Deploy the ONNX model and the [drone_vision](file:///home/abdullah/Drone/ros2_ws/build/drone_vision) package to the Pi.
+3.  Verify inference speeds and CPU usage. Provide dynamic control over the real PX4.
