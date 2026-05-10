@@ -22,8 +22,7 @@ Publishes:
   /gimbal/health                        diagnostic_msgs/DiagnosticStatus
   /drone/camera_raw_stabilised          cropped ROI (sensor_msgs/Image)
 """
-import math
-
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -236,7 +235,6 @@ class GimbalSim(Node):
         roi = cv_img[y0c:y1c, x0c:x1c]
         # If clamped, pad to crop size with black so downstream gets a fixed-size frame.
         if roi.shape[0] != self.crop_h or roi.shape[1] != self.crop_w:
-            import numpy as np
             padded = np.zeros((self.crop_h, self.crop_w, 3), dtype=roi.dtype)
             ox = max(0, -x0)
             oy = max(0, -y0)

@@ -169,11 +169,22 @@ class PayloadServoNode(Node):
                 self.get_logger().warn(f"Drop refused: {reason}")
                 return response
 
+            # Optional pre-drop delay — run on a thread so we don't block
+            # the rclpy executor for hundreds of ms.
             delay = max(0, int(request.delay_ms)) / 1000.0
             if delay > 0:
                 self.get_logger().info(f"Dropping in {delay:.2f}s")
-                time.sleep(delay)
+                threading.Timer(delay, self._do_drop).start()
+            else:
+                self._do_drop()
+            response.ok = True
+            response.reason = ""
+            return response
 
+    def _do_drop(self):
+        with self._drop_lock:
+            if self._dropped:
+                return
             try:
                 self.pi.set_servo_pulsewidth(self.gpio_pin, self.pwm_open)
                 self.get_logger().info(
@@ -184,16 +195,9 @@ class PayloadServoNode(Node):
             except Exception as e:
                 self.get_logger().error(f"pigpio write failed: {e}")
                 self._set_state(self.STATE_FAULT)
-                response.ok = False
-                response.reason = f"pigpio_error: {e}"
-                return response
-
+                return
             # Schedule a re-close after open_hold_secs (one-shot)
             threading.Timer(self.open_hold, self._reclose).start()
-
-            response.ok = True
-            response.reason = ""
-            return response
 
     def _reclose(self):
         try:

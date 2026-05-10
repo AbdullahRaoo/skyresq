@@ -133,13 +133,26 @@ class PayloadServoSim(Node):
             self.get_logger().warn(f"Drop refused: {reason}")
             return response
 
-        # Honour optional pre-drop delay
+        # Honour optional pre-drop delay. We acknowledge the request
+        # immediately and arm a timer to do the actual drop — this avoids
+        # blocking the rclpy executor (which would freeze every other
+        # callback while we wait).
         delay = max(0, int(request.delay_ms)) / 1000.0
         if delay > 0:
             self.get_logger().info(f"Dropping in {delay:.2f}s")
-            time.sleep(delay)
+            self.create_timer(delay, self._do_drop_once)
+        else:
+            self._do_drop_once()
 
-        # Sim: log the drop with the current target estimate
+        response.ok = True
+        response.reason = ""
+        return response
+
+    def _do_drop_once(self):
+        # One-shot: cancel the timer that called us if any, perform the
+        # log + state transition, then keep going.
+        if self.state == self.STATE_DROPPED:
+            return
         if self.last_target_ned is not None:
             tn = self.last_target_ned
             self.get_logger().info(
@@ -148,11 +161,7 @@ class PayloadServoSim(Node):
         else:
             self.get_logger().info(
                 f"PAYLOAD DROPPED | AGL {self.agl_m:.1f} m (no target lock recorded)")
-
         self._set_state(self.STATE_DROPPED)
-        response.ok = True
-        response.reason = ""
-        return response
 
     def _check_interlocks(self, arm_drop):
         if not arm_drop:

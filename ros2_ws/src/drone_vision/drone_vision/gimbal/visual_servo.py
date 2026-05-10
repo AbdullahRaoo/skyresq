@@ -19,7 +19,6 @@ Publishes:
 """
 import rclpy
 from rclpy.node import Node
-from rclpy.time import Time
 from geometry_msgs.msg import PointStamped
 
 
