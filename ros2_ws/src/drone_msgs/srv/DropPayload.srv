@@ -1,0 +1,8 @@
+# Trigger payload release.
+# Request must explicitly set arm_drop=true; safety interlocks in the payload node may still refuse.
+
+bool   arm_drop      # must be true to actually drop
+uint32 delay_ms      # optional: wait this many ms before releasing (0 = immediate)
+---
+bool   ok            # true if drop was triggered
+string reason        # human-readable explanation (empty on ok=true)

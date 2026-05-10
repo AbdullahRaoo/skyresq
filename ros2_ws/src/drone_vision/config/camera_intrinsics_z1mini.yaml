@@ -1,0 +1,10 @@
+# Camera intrinsics for the Allxianfei Z-1 Mini 4K.
+# PLACEHOLDER — replace with values from chequerboard calibration before flight.
+# Pre-flight task tracked in plan Open Question 5.
+
+camera:
+  width:  1920          # set to whatever stream resolution we subscribe at
+  height: 1080
+  hfov_rad: 1.20        # ~69 deg — typical 4K narrow lens; CONFIRM
+  distortion_model: "plumb_bob"
+  D: [0.0, 0.0, 0.0, 0.0, 0.0]

@@ -1,0 +1,11 @@
+# Camera intrinsics for the SITL x500_mono_cam.
+# Derived from sensor SDF: 640x480, horizontal_fov = 1.74 rad (≈100 deg).
+# fx = (width/2) / tan(hfov/2), fy = fx (square pixels), principal point at image centre.
+
+camera:
+  width:  640
+  height: 480
+  hfov_rad: 1.74
+  # Computed fx ≈ 213.5 (we keep the raw inputs; the geo node computes K from these)
+  distortion_model: "plumb_bob"
+  D: [0.0, 0.0, 0.0, 0.0, 0.0]

@@ -7,7 +7,15 @@ ROOT="$HOME/Drone"
 PX4_ROOT="$ROOT/PX4-Autopilot"
 LOG_DIR="$ROOT/.run_logs"
 PID_DIR="$ROOT/.run_pids"
+WORLD_NAME="${WORLD_NAME:-sar_test}"
+WORLD_FILE="$PX4_ROOT/Tools/simulation/gz/worlds/${WORLD_NAME}.sdf"
 mkdir -p "$LOG_DIR" "$PID_DIR"
+
+if [[ ! -f "$WORLD_FILE" ]]; then
+  echo "[ERROR] World file not found: $WORLD_FILE"
+  echo "Set WORLD_NAME=<world_without_sdf> and retry."
+  exit 1
+fi
 
 function clean_env_exec() {
   local cmd="$1"
@@ -30,11 +38,11 @@ function clean_env_exec() {
     "
 }
 
-echo "[1/4] Starting Gazebo world (GUI)..."
+echo "[1/4] Starting Gazebo (server-only, no GUI)..."
 clean_env_exec "
   cd '$PX4_ROOT'
   source build/px4_sitl_default/rootfs/gz_env.sh
-  gz sim -r '$PX4_ROOT/Tools/simulation/gz/worlds/default.sdf'
+  gz sim -s -r '$WORLD_FILE'
 " >"$LOG_DIR/gz.log" 2>&1 &
 echo $! > "$PID_DIR/gz.pid"
 sleep 3
@@ -44,6 +52,7 @@ clean_env_exec "
   cd '$PX4_ROOT'
   source build/px4_sitl_default/rootfs/gz_env.sh
   export PX4_GZ_STANDALONE=1
+  export PX4_GZ_WORLD='${WORLD_NAME}'
   make px4_sitl gz_x500_mono_cam
 " >"$LOG_DIR/px4.log" 2>&1 &
 echo $! > "$PID_DIR/px4.pid"
@@ -60,12 +69,14 @@ echo "[4/4] Starting ROS detection pipeline..."
 clean_env_exec "
   source /opt/ros/jazzy/setup.bash
   source '$ROOT/ros2_ws/install/setup.bash'
-  ros2 launch drone_vision detection.launch.py mode:=search
+  ros2 launch drone_vision sitl.launch.py mode:=search
 " >"$LOG_DIR/ros.log" 2>&1 &
 echo $! > "$PID_DIR/ros.pid"
 sleep 2
 
 echo "Startup complete."
+echo "- World: $WORLD_NAME (server-only, no GUI)"
 echo "- Logs: $LOG_DIR"
 echo "- PIDs: $PID_DIR"
-echo "- Open camera: $ROOT/view_camera.sh debug"
+echo "- Open camera feed: $ROOT/view_camera.sh debug"
+echo "- Open Gazebo GUI (optional): gz gui"

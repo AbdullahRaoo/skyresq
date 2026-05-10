@@ -1,0 +1,23 @@
+# Mission node parameters. Loaded as ROS 2 params at launch.
+# Defaults match the inline declare_parameter() values in mission_node.py prior to PR-0.
+
+mission_node:
+  ros__parameters:
+    mode: "search"              # 'square' (test) | 'search' (SAR loop)
+
+    # Flight envelope
+    takeoff_height: 5.0         # metres, positive up; converted to NED internally
+    descend_altitude: 2.0       # metres AGL at delivery hover
+    waypoint_threshold: 1.5     # metres to consider a waypoint reached
+
+    # Search behaviour (current orbit; lawnmower comes in PR-2b)
+    search_radius: 15.0         # metres
+    search_speed: 1.5           # m/s tangential
+
+    # Tracking / target gates
+    tracking_speed: 2.0         # m/s max horizontal nudge during TRACK
+    target_lost_timeout: 5.0    # seconds before reverting to SEARCH
+    target_confirm_secs: 3.0    # continuous detection time to confirm
+
+    # Square test path (legacy)
+    square_size: 10.0           # metres per side

@@ -1,0 +1,54 @@
+# Gimbal subsystem parameters. Used starting PR-1a.
+
+# Real-hardware controller node (PR-5a). Parameters here are consumed when the
+# gimbal_controller is launched on hardware.
+gimbal_controller:
+  ros__parameters:
+    backend: "sim"              # 'sim' | 'mavlink' | 'vendor_tcp'
+    vendor_host: "192.168.144.25"   # default for many SIYI/Allxianfei devices
+    vendor_port: 37260
+
+    max_rate_dps: 60.0
+    pitch_min_deg: -90.0
+    pitch_max_deg: 30.0
+    yaw_min_deg: -180.0
+    yaw_max_deg: 180.0
+
+    servo_kp_yaw: 30.0
+    servo_kp_pitch: 30.0
+    servo_deadband: 0.03
+
+    state_publish_hz: 20.0
+    health_publish_hz: 1.0
+
+# Sim-only node (PR-1a). Holds the same control gains plus crop settings.
+# Duplication is intentional — ROS 2 params are scoped per node name and we
+# want each binary to be loadable in isolation.
+gimbal_sim:
+  ros__parameters:
+    # Source / output camera topics
+    source_topic: "/drone/camera_raw"
+    stabilised_topic: "/drone/camera_raw_stabilised"
+    source_hfov_deg: 100.0      # x500_mono_cam horizontal FOV
+    crop_width: 320
+    crop_height: 240
+
+    # Rate limits + visual-servo gains (mirrored from gimbal_controller)
+    max_rate_dps: 60.0
+    pitch_min_deg: -90.0
+    pitch_max_deg: 30.0
+    yaw_min_deg: -180.0
+    yaw_max_deg: 180.0
+    servo_kp_yaw: 30.0
+    servo_kp_pitch: 30.0
+    servo_deadband: 0.03
+
+    # Sim integration rate
+    integration_hz: 50.0
+    state_publish_hz: 20.0
+    health_publish_hz: 1.0
+
+    # Initial gimbal attitude — start pointing downward so the wide
+    # source camera's cropped view actually sees the ground during SEARCH.
+    init_pitch_deg: -30.0
+    init_yaw_deg:    0.0

@@ -1,0 +1,11 @@
+# Person detector parameters. Wired in by PR-4 (backend selection); for PR-0 just match current defaults.
+
+person_detector:
+  ros__parameters:
+    model_path: ""              # empty → auto-resolve under ~/Drone (yolo26n.onnx preferred)
+    confidence_threshold: 0.45
+    image_topic: "/drone/camera_raw"
+    target_class: 0             # COCO class 0 = person
+    process_every_n: 3          # frame skip for CPU
+    imgsz: 640                  # ONNX export shape — must match exported model
+    backend: "ultralytics"      # 'ultralytics' (PC) | 'ncnn' (Pi). Honoured starting PR-4.

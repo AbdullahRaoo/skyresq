@@ -1,0 +1,20 @@
+# Payload subsystem parameters. Wired in by PR-2b (sim) and PR-3 (real).
+
+payload_servo:
+  ros__parameters:
+    # GPIO (real path)
+    backend: "sim"              # 'sim' | 'pigpio'
+    gpio_pin: 18                # BCM numbering, hardware PWM-capable on Pi 4
+    pwm_us_closed: 1100         # servo pulse width when payload retained
+    pwm_us_open: 1900           # servo pulse width when payload released
+    open_hold_secs: 3.0         # how long to keep open before re-closing
+
+    # Safety interlocks (refuse drop unless all satisfied)
+    min_drop_alt_m: 1.5         # AGL — below this is too low (snag risk)
+    max_drop_alt_m: 10.0        # AGL — above this is too high (toss radius)
+    target_freshness_secs: 1.5  # require recent target sighting
+    require_armed_offboard: true
+    require_battery_above: 0.20 # 0..1, refuse if below
+
+    # Telemetry
+    state_publish_hz: 1.0
