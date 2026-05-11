@@ -157,10 +157,14 @@ class _NcnnBackend:
 
         self.net = ncnn.Net()
         self.net.opt.use_vulkan_compute = False             # CPU-only on Pi
-        # Pin to 3 threads on a Pi 4 — leaves one core for ROS executors,
-        # camera I/O, and the rest of the pipeline. ncnn would otherwise
-        # default to 1 thread under some Python wheels (~5x slowdown).
-        self.net.opt.num_threads = 3
+        # Pin to 2 threads on the Pi 4. Standalone benchmark shows 3 threads
+        # is the local optimum (9.4 Hz vs 8.3 Hz), BUT in the full pipeline
+        # there are 5 other Python processes (mavlink_bridge, rtsp_camera,
+        # visual_servo, geo_localiser, gcs_link) all contending for the
+        # 4 cores. Leaving 2 cores for those processes drops in-pipeline
+        # inference from ~1500 ms to ~400 ms — a net 4x win for the system
+        # even though single-frame inference is slightly slower in isolation.
+        self.net.opt.num_threads = 2
         self.net.load_param(param_path)
         self.net.load_model(bin_path)
         self.imgsz = imgsz
@@ -306,6 +310,13 @@ class PersonDetector(Node):
         self.declare_parameter('target_inference_hz', 0.0)
         self.declare_parameter('frame_skip_min', 2)
         self.declare_parameter('frame_skip_max', 6)
+        # /camera/image_debug republishes the full-res frame with bboxes drawn
+        # over it. Off by default — costs ~30 ms/frame on a Pi 4 at 1920x1080
+        # AND another image-msg serialise + publish. The GCS uses /detections
+        # (bboxes only) for its overlay, not this topic.
+        self.declare_parameter('publish_debug', False)
+        # Log a per-stage timing line every N seconds (0 = disabled)
+        self.declare_parameter('timing_log_period_s', 0.0)
 
         model_path = self.get_parameter('model_path').value
         self.conf_thresh = self.get_parameter('confidence_threshold').value
@@ -317,6 +328,9 @@ class PersonDetector(Node):
         self.target_hz = float(self.get_parameter('target_inference_hz').value)
         self.skip_min = int(self.get_parameter('frame_skip_min').value)
         self.skip_max = int(self.get_parameter('frame_skip_max').value)
+        self._publish_debug = bool(self.get_parameter('publish_debug').value)
+        self._timing_period = float(self.get_parameter('timing_log_period_s').value)
+        self._last_timing_log = 0.0
 
         # === Resolve model path ====================================
         model_path = self._resolve_model_path(model_path, backend_name)
@@ -388,24 +402,27 @@ class PersonDetector(Node):
         if self.frame_count % self.process_every_n != 0:
             return
 
+        t_cb_start = time.perf_counter()
+
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         except Exception as e:
             self.get_logger().warn(f"cv_bridge convert failed: {e}", throttle_duration_sec=5.0)
             return
+        t_decode = time.perf_counter()
 
-        # Inference
-        t0 = time.perf_counter()
         try:
             detections = self.backend.infer(bgr)
         except Exception as e:
             self.get_logger().error(f"Inference error: {e}", throttle_duration_sec=5.0)
             return
-        latency = time.perf_counter() - t0
+        t_infer = time.perf_counter()
+
+        latency = t_infer - t_decode
         self.latency_window.append(latency)
         self._maybe_adapt_frame_skip()
 
-        # Build messages
+        # Build /detections — small, always published
         det_msg = Detection2DArray()
         det_msg.header = msg.header
         best_conf = 0.0
@@ -436,10 +453,6 @@ class PersonDetector(Node):
                 best_cx = cx
                 best_cy = cy
 
-            cv2.rectangle(bgr, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-            cv2.putText(bgr, f"{name} {conf:.2f}", (int(x1), int(y1) - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
         self.det_pub.publish(det_msg)
 
         if best_conf > 0:
@@ -450,16 +463,43 @@ class PersonDetector(Node):
             tp.point.z = float(best_conf)
             self.target_pub.publish(tp)
 
-        cv2.putText(bgr, f"{self.backend.name} | {len(detections)} | "
-                          f"{latency*1000:.0f}ms | every={self.process_every_n}",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
-        self.debug_pub.publish(self.bridge.cv2_to_imgmsg(bgr, encoding='bgr8'))
+        t_pubs = time.perf_counter()
+
+        # Debug-image branch is the expensive one — full-res draw + encode +
+        # publish. Keep it off in production; on dev box you'd enable it via
+        # the publish_debug parameter to see what the detector sees.
+        if self._publish_debug:
+            for (x1, y1, x2, y2), conf, _cls, name in detections:
+                cv2.rectangle(bgr, (int(x1), int(y1)),
+                              (int(x2), int(y2)), (0, 255, 0), 2)
+                cv2.putText(bgr, f"{name} {conf:.2f}", (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            cv2.putText(
+                bgr,
+                f"{self.backend.name} | {len(detections)} | "
+                f"{latency*1000:.0f}ms | every={self.process_every_n}",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2,
+            )
+            self.debug_pub.publish(self.bridge.cv2_to_imgmsg(bgr, encoding='bgr8'))
+        t_debug = time.perf_counter()
 
         if len(detections) > 0:
             self.get_logger().info(
                 f"Detected {len(detections)} person(s) | best conf: {best_conf:.2f} | "
                 f"pos: ({best_cx:.0f}, {best_cy:.0f}) | inf {latency*1000:.0f}ms",
                 throttle_duration_sec=1.0)
+
+        if self._timing_period > 0:
+            now = time.monotonic()
+            if now - self._last_timing_log >= self._timing_period:
+                self._last_timing_log = now
+                self.get_logger().info(
+                    f"timing | decode={int(1000*(t_decode-t_cb_start))}ms "
+                    f"infer={int(1000*(t_infer-t_decode))}ms "
+                    f"pubs={int(1000*(t_pubs-t_infer))}ms "
+                    f"debug={int(1000*(t_debug-t_pubs))}ms "
+                    f"total={int(1000*(t_debug-t_cb_start))}ms"
+                )
 
 
 def main(args=None):

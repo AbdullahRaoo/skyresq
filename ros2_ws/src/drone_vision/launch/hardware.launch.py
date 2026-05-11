@@ -31,7 +31,8 @@ import os
 from launch import LaunchDescription
 from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression
 
 VENV_SITE = os.path.expanduser("~/Drone/venv/lib/python3.12/site-packages")
 
@@ -58,6 +59,11 @@ def generate_launch_description():
                               description="Detector backend: ncnn | onnx | ultralytics"),
         DeclareLaunchArgument("gst_pipeline",      default_value="",
                               description="Optional GStreamer pipeline for HW decode"),
+        # Skip visual_servo + run gimbal_controller at low rate when the
+        # gimbal protocol isn't wired yet (see docs/GIMBAL_PROTOCOL_NOTES.md).
+        # Bumps detector throughput ~3x by freeing CPU cores.
+        DeclareLaunchArgument("gimbal_active",     default_value="false",
+                              description="true once Z-1 Mini control protocol is fixed"),
     ]
 
     # ── MAVLink Bridge ────────────────────────────────────────────────
@@ -95,6 +101,9 @@ def generate_launch_description():
     )
 
     # ── Gimbal Controller ─────────────────────────────────────────────
+    # command_rate_hz is gated by gimbal_active: at 50 Hz when the real
+    # gimbal is wired (visual_servo needs a fast outbound stream), at 10 Hz
+    # when only providing /gimbal/state to geo_localiser.
     gimbal_controller = Node(
         package="drone_vision",
         executable="gimbal_controller",
@@ -103,16 +112,21 @@ def generate_launch_description():
             "gimbal_host":     LaunchConfiguration("gimbal_host"),
             "gimbal_port":     LaunchConfiguration("gimbal_port"),
             "backend":         LaunchConfiguration("gimbal_backend"),
-            "command_rate_hz": 50.0,
+            "command_rate_hz": PythonExpression([
+                "50.0 if '", LaunchConfiguration("gimbal_active"),
+                "'.lower() == 'true' else 10.0",
+            ]),
         }],
         output="screen",
     )
 
     # ── Visual Servo (50 Hz pixel error republisher) ─────────────────
+    # Only useful when the gimbal can actually move — gated by gimbal_active.
     visual_servo = Node(
         package="drone_vision",
         executable="visual_servo",
         name="visual_servo",
+        condition=IfCondition(LaunchConfiguration("gimbal_active")),
         output="screen",
     )
 

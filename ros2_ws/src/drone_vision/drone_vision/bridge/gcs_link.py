@@ -56,7 +56,6 @@ from rclpy.node import Node
 
 from drone_msgs.msg import TargetWorld
 from geometry_msgs.msg import Vector3Stamped
-from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 from vision_msgs.msg import Detection2DArray
 
@@ -187,8 +186,11 @@ class GcsLinkNode(Node):
         self.declare_parameter("confidence_min",    0.50)
         self.declare_parameter("mavlink_port",      "")
         self.declare_parameter("mavlink_baud",      57600)
-        self.declare_parameter("stream_width",      1280)
-        self.declare_parameter("stream_height",     720)
+        # Z-1 Mini ships 1920x1080 H.264. Override at launch if your camera
+        # is different — detection_frame embeds these so the GCS knows how
+        # to scale bbox pixels back onto its rendered video.
+        self.declare_parameter("stream_width",      1920)
+        self.declare_parameter("stream_height",     1080)
         self.declare_parameter("status_period_s",   1.0)
 
         self._gcs_ip   = self.get_parameter("gcs_ip").value
@@ -207,9 +209,12 @@ class GcsLinkNode(Node):
         self._link_ok = True
         self._start_t = time.monotonic()
 
-        # Health trackers — populated by the *_seen subscriptions
+        # Health trackers — populated by the *_seen subscriptions.
+        # No camera tracker: subscribing to /drone/camera_raw cost ~12% CPU
+        # on a Pi 4 just to read width/height. Detector liveness implies
+        # camera liveness (no frames = no /detections), so we report
+        # camera.ok = detector.ok in pi_status.
         self._detector_rate = _RateCounter()
-        self._camera_rate   = _RateCounter()
         self._gimbal_rate   = _RateCounter()
         self._fc_rate       = _RateCounter()
         self._gimbal_pitch  = 0.0
@@ -237,7 +242,11 @@ class GcsLinkNode(Node):
         self.create_subscription(
             Detection2DArray, "/detections", self._on_detection_frame, 10
         )
-        self.create_subscription(Image, "/drone/camera_raw", self._on_camera, 1)
+        # NOTE: we deliberately do NOT subscribe to /drone/camera_raw. The
+        # parsed image carries ~6 MB per frame; even though we only want the
+        # width/height fields, rclpy still deserialises the whole payload.
+        # That subscription costs ~12% CPU on a Pi 4 and starves the
+        # detector. stream_width/stream_height are parameters now.
         self.create_subscription(Vector3Stamped, "/gimbal/state", self._on_gimbal, 10)
         self.create_subscription(Bool, "/vehicle/armed", self._on_armed, 10)
 
@@ -328,18 +337,6 @@ class GcsLinkNode(Node):
 
     # ── Health tracker callbacks ──────────────────────────────────────
 
-    def _on_camera(self, _msg: Image):
-        # Use the message to learn the actual stream size on first arrival
-        if (_msg.width and _msg.height
-                and (_msg.width != self._stream_w or _msg.height != self._stream_h)):
-            self._stream_w = int(_msg.width)
-            self._stream_h = int(_msg.height)
-            self.get_logger().info(
-                f"stream size learnt from /drone/camera_raw: "
-                f"{self._stream_w}x{self._stream_h}"
-            )
-        self._camera_rate.tick()
-
     def _on_gimbal(self, msg: Vector3Stamped):
         self._gimbal_rate.tick()
         self._gimbal_pitch = float(msg.vector.y)
@@ -360,6 +357,9 @@ class GcsLinkNode(Node):
         def _fresh(counter: _RateCounter, max_age_s: float) -> bool:
             return counter.last_seen > 0 and (now - counter.last_seen) <= max_age_s
 
+        detector_ok = _fresh(self._detector_rate, 5.0)
+        detector_fps = round(self._detector_rate.fps(), 1)
+
         packet = {
             "type":          "pi_status",
             "ts_ms":         int(time.time() * 1000),
@@ -369,12 +369,14 @@ class GcsLinkNode(Node):
             "ram_used_mb":   ram_used,
             "ram_total_mb": ram_total,
             "detector": {
-                "ok":          _fresh(self._detector_rate, 5.0),
-                "fps":         round(self._detector_rate.fps(), 1),
+                "ok":  detector_ok,
+                "fps": detector_fps,
             },
+            # Camera liveness derived from detector — same field shape so
+            # the GCS-side UI doesn't need to special-case anything.
             "camera": {
-                "ok":          _fresh(self._camera_rate, 2.0),
-                "fps":         round(self._camera_rate.fps(), 1),
+                "ok":  detector_ok,
+                "fps": detector_fps,
             },
             "gimbal": {
                 "ok":          _fresh(self._gimbal_rate, 2.0),
