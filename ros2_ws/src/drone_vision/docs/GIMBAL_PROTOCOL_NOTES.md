@@ -3,12 +3,13 @@
 > Reverse-engineering notes for the XF Robot Z-1 Mini gimbal's TCP control
 > protocol on `192.168.144.108:2332`.
 >
-> **Status (2026-05-11, post-fix):** protocol implementation
+> **Status (2026-05-11, bench-verified ✓):** protocol implementation
 > [gimbal_controller.py](../drone_vision/gimbal/gimbal_controller.py)
 > rewritten to match the authoritative ArduPilot driver
-> ([`AP_Mount_XFRobot.cpp`](https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_Mount/AP_Mount_XFRobot.cpp)).
-> Packet round-trips against the reference; bench validation against the
-> real gimbal still pending the next time the Pi is on the network.
+> ([`AP_Mount_XFRobot.cpp`](https://github.com/ArduPilot/ardupilot/blob/master/libraries/AP_Mount/AP_Mount_XFRobot.cpp))
+> and **physically tested against the real Z-1 Mini**. Both pitch and yaw
+> respond to commanded slews; the gimbal also returns its attitude in the
+> reply packets.
 
 ## What works (RTSP side)
 
@@ -121,20 +122,37 @@ The gimbal silently discards malformed packets (no NAK, no disconnect),
 which made every one of these mistakes invisible until we read the
 reference driver.
 
-## Bench validation (procedure for next test)
+## Bench validation — passed (2026-05-11)
 
-1. Pi powered up, ROS 2 workspace built (current state).
-2. From the dev PC, run the motion test from earlier:
-   ```bash
-   echo 'bash /tmp/bench_gimbal_motion.sh' | python3 /tmp/pi_run.py
-   ```
-3. Watch the gimbal during the 4-step sequence:
-   - Pan right 30°
-   - Pan back left 60° (ends 30° left of centre)
-   - Return centre + tilt up 20°
-   - Tilt back down to nadir
-4. If gimbal moves correctly: **success**, mark protocol verified.
-5. If still not moving: capture traffic from the vendor app, compare bytes.
+Ran the four-step sequence against the real gimbal:
+
+| Step | Commanded | Observed (visual + log) |
+|---|---|---|
+| Startup | (defaults yaw=0, pitch=-90) | camera tilted from looking-forward to nadir ✓ |
+| 1 | Pan right 30° | gimbal yawed right ✓ |
+| 2 | Pan left 60° | gimbal yawed back through centre then left ✓ |
+| 3 | Return centre + tilt up 20° | gimbal returned to centre yaw; pitch went -90→-70 (per log) ✓ |
+| 4 | Tilt back down to nadir | pitch returned -70→-90 (per log) ✓ |
+
+Reply packets parsed cleanly — `/gimbal/state` reports live roll/pitch/yaw
+in degrees on every send tick. Notably:
+
+- Pitch follows commanded angle directly.
+- Yaw replies report the **absolute world-frame** orientation
+  (`yaw_abs_cd` at bytes 22-23), not the commanded relative yaw. The
+  command field (`yaw_control` at bytes 9-10) is relative-to-vehicle,
+  but the reply tells us where the camera is actually pointing in the
+  world. Both useful: relative for control-loop, absolute for
+  geo-localiser.
+
+## Subtle bug found during validation: yaw is signed int16 in the reply
+
+ArduPilot's `AP_Mount_XFRobot.h` declares `yaw_abs_cd` as
+`uint16_t (0 ~ +36000)`. **The live firmware in our Z-1 Mini sends signed
+int16 centi-degrees** in this field — confirmed on bench: a -30° yaw came
+back as 0xF43C, which as uint16 = 62524 (out of the documented range), but
+as int16 = -3036 = -30.36°. The parser now reads all three attitude
+fields as int16.
 
 ## If it still doesn't work — manufacturer app sniff
 

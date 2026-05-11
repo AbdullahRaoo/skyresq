@@ -183,12 +183,16 @@ def parse_state_packet(buf: bytearray):
     if _crc16_xmodem(body) != crc_pkt:
         return 1, None    # Bad CRC, drop header and re-sync
 
-    # Camera attitude — int16 centi-degrees at bytes 18-19, 20-21, 22-23
-    roll_cd, pitch_cd, yaw_cd = struct.unpack_from("<hhH", buf, 18)
+    # Camera attitude — all int16 centi-degrees at bytes 18-19, 20-21, 22-23.
+    # ArduPilot's .h declares yaw_abs_cd as uint16 with range 0..36000, but
+    # the live firmware in the Z-1 Mini we have here actually sends signed
+    # int16 — confirmed on bench: a -30° yaw came back as 62500 raw (uint16
+    # interpretation) = -3036 (int16 interpretation = correct -30.36°).
+    roll_cd, pitch_cd, yaw_cd = struct.unpack_from("<hhh", buf, 18)
     return total, {
         "roll_deg":  roll_cd  / 100.0,
         "pitch_deg": pitch_cd / 100.0,
-        "yaw_deg":   yaw_cd   / 100.0,   # 0..360 unsigned
+        "yaw_deg":   yaw_cd   / 100.0,
         "raw_order": buf[69] if total > 70 else None,
     }
 
@@ -373,17 +377,15 @@ class GimbalControllerNode(Node):
             return None
 
     def _handle_inbound(self, parsed: dict):
-        # parse_state_packet now returns the camera attitude directly
-        # (extracted from bytes 18-23 of the reply: roll/pitch/yaw_abs_cd).
-        # yaw is unsigned 0..360 from the gimbal — convert to signed -180..+180
-        # so /gimbal/state matches the convention everywhere else.
-        yaw_signed = parsed["yaw_deg"]
-        if yaw_signed > 180.0:
-            yaw_signed -= 360.0
+        # parse_state_packet returns roll/pitch/yaw as signed centi-degrees
+        # converted to degrees. Normalise yaw to -180..+180 in case the
+        # gimbal ever sends an out-of-range value.
+        yaw_deg = parsed["yaw_deg"]
+        yaw_norm = ((yaw_deg + 180.0) % 360.0) - 180.0
         with self._lock:
             self._state_roll  = parsed["roll_deg"]
             self._state_pitch = parsed["pitch_deg"]
-            self._state_yaw   = yaw_signed
+            self._state_yaw   = yaw_norm
         self._publish_state()
 
 
