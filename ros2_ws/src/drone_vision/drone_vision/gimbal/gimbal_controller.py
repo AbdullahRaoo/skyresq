@@ -204,18 +204,23 @@ class GimbalControllerNode(Node):
     def __init__(self):
         super().__init__("gimbal_controller")
 
-        self.declare_parameter("gimbal_host",      "192.168.144.108")
-        self.declare_parameter("gimbal_port",      2332)
-        self.declare_parameter("command_rate_hz",  50.0)
-        self.declare_parameter("state_rate_hz",    20.0)
-        self.declare_parameter("backend",          "tcp")
-        self.declare_parameter("pixel_gain_yaw",   30.0)
-        self.declare_parameter("pixel_gain_pitch", 20.0)
-        self.declare_parameter("yaw_min_deg",      -180.0)
-        self.declare_parameter("yaw_max_deg",      180.0)
-        self.declare_parameter("pitch_min_deg",    -90.0)
-        self.declare_parameter("pitch_max_deg",    30.0)
-        self.declare_parameter("reconnect_s",      2.0)
+        self.declare_parameter("gimbal_host",       "192.168.144.108")
+        self.declare_parameter("gimbal_port",       2332)
+        self.declare_parameter("command_rate_hz",   50.0)
+        self.declare_parameter("state_rate_hz",     20.0)
+        self.declare_parameter("backend",           "tcp")
+        self.declare_parameter("pixel_gain_yaw",    30.0)
+        self.declare_parameter("pixel_gain_pitch",  20.0)
+        self.declare_parameter("yaw_min_deg",       -180.0)
+        self.declare_parameter("yaw_max_deg",        180.0)
+        self.declare_parameter("pitch_min_deg",     -90.0)
+        self.declare_parameter("pitch_max_deg",      30.0)
+        self.declare_parameter("reconnect_s",        2.0)
+        # Initial pose — gimbal slews here on startup before any pixel cmds
+        # arrive. Default nadir for flight ops; bench tests typically set
+        # initial_pitch_deg ~= -10 so the camera looks forward at people.
+        self.declare_parameter("initial_pitch_deg", -90.0)
+        self.declare_parameter("initial_yaw_deg",     0.0)
 
         self._host       = self.get_parameter("gimbal_host").value
         self._port       = int(self.get_parameter("gimbal_port").value)
@@ -231,10 +236,14 @@ class GimbalControllerNode(Node):
 
         # ── Setpoint state (commanded gimbal pose, NED-like body frame) ──
         # pitch = down +, yaw = right + (matches gimbal_sim conventions)
-        self._target_pitch = -90.0   # start nadir
-        self._target_yaw   = 0.0
-        self._state_pitch  = -90.0
-        self._state_yaw    = 0.0
+        init_pitch = float(self.get_parameter("initial_pitch_deg").value)
+        init_yaw   = float(self.get_parameter("initial_yaw_deg").value)
+        self._target_pitch = max(self._pitch_min, min(self._pitch_max, init_pitch))
+        self._target_yaw   = max(self._yaw_min,   min(self._yaw_max,   init_yaw))
+        # Seed state with the same values so /gimbal/state reads sensibly
+        # before the gimbal sends its first reply
+        self._state_pitch  = self._target_pitch
+        self._state_yaw    = self._target_yaw
         self._state_roll   = 0.0
         self._lock = threading.Lock()
 

@@ -317,6 +317,13 @@ class PersonDetector(Node):
         self.declare_parameter('publish_debug', False)
         # Log a per-stage timing line every N seconds (0 = disabled)
         self.declare_parameter('timing_log_period_s', 0.0)
+        # How to pick the single "best" detection to drive /target_position:
+        #   'confidence' : highest-conf detection (default, matches original)
+        #   'area'       : largest bbox area (closest person to camera —
+        #                  much more robust to stationary background false
+        #                  positives in cluttered indoor scenes)
+        #   'center'     : closest to image centre (continuity tracking)
+        self.declare_parameter('best_by', 'confidence')
 
         model_path = self.get_parameter('model_path').value
         self.conf_thresh = self.get_parameter('confidence_threshold').value
@@ -331,6 +338,12 @@ class PersonDetector(Node):
         self._publish_debug = bool(self.get_parameter('publish_debug').value)
         self._timing_period = float(self.get_parameter('timing_log_period_s').value)
         self._last_timing_log = 0.0
+        self._best_by = self.get_parameter('best_by').value
+        if self._best_by not in ('confidence', 'area', 'center'):
+            self.get_logger().warning(
+                f"unknown best_by '{self._best_by}' — falling back to 'confidence'"
+            )
+            self._best_by = 'confidence'
 
         # === Resolve model path ====================================
         model_path = self._resolve_model_path(model_path, backend_name)
@@ -425,10 +438,13 @@ class PersonDetector(Node):
         # Build /detections — small, always published
         det_msg = Detection2DArray()
         det_msg.header = msg.header
+        best_score = float('-inf')
         best_conf = 0.0
         best_cx = 0.0
         best_cy = 0.0
         img_h, img_w = bgr.shape[:2]
+        img_cx = img_w / 2.0
+        img_cy = img_h / 2.0
         for (x1, y1, x2, y2), conf, cls, name in detections:
             w = x2 - x1
             h = y2 - y1
@@ -448,8 +464,16 @@ class PersonDetector(Node):
             d.results.append(hyp)
             det_msg.detections.append(d)
 
-            if conf > best_conf:
-                best_conf = conf
+            if self._best_by == 'area':
+                score = w * h
+            elif self._best_by == 'center':
+                # Negative distance-to-centre so larger score = closer
+                score = -(abs(cx - img_cx) + abs(cy - img_cy))
+            else:  # 'confidence'
+                score = conf
+            if score > best_score:
+                best_score = score
+                best_conf = conf       # always carry the real conf downstream
                 best_cx = cx
                 best_cy = cy
 

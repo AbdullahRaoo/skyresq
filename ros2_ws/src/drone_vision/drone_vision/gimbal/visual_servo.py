@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-Visual servo bridge.
+Visual servo bridge — passthrough.
 
-Detector publishes /target_position at the detector's effective rate
-(~7-15 Hz on this hardware after frame skipping). The gimbal needs a
-smooth high-rate command. This node holds the last valid pixel error
-and republishes it to /gimbal/cmd/look_at_pixel at servo_hz.
+Forwards each /target_position event to /gimbal/cmd/look_at_pixel
+one-to-one. No rate multiplication.
 
-When the target hasn't been seen within target_lost_timeout, this node
-stops emitting commands so the gimbal will hold its last attitude
-(rather than drift to zero).
+Why pass-through and not "republish at 50 Hz"
+  The downstream gimbal_controller treats every pixel command as a
+  cumulative delta (target += error * gain). Re-publishing the SAME
+  pixel error 50× a second is interpreted as 50 fresh deltas → runaway
+  slew. One forward per detection means the cumulative model converges
+  cleanly over a few detections.
+
+When the target hasn't been seen for target_lost_timeout seconds, this
+node stops emitting commands so the gimbal holds its last attitude
+(rather than drifting to zero).
 
 Subscribes:
   /target_position    geometry_msgs/PointStamped (normalised -1..1, .z=conf)
@@ -28,10 +33,8 @@ class VisualServo(Node):
 
         self.declare_parameter('target_topic', '/target_position')
         self.declare_parameter('command_topic', '/gimbal/cmd/look_at_pixel')
-        self.declare_parameter('servo_hz', 50.0)
         self.declare_parameter('target_lost_timeout', 1.5)  # seconds
 
-        self.servo_hz = float(self.get_parameter('servo_hz').value)
         self.lost_timeout_ns = int(self.get_parameter('target_lost_timeout').value * 1e9)
 
         self.create_subscription(
@@ -46,31 +49,24 @@ class VisualServo(Node):
             10,
         )
 
-        self.last_target = None        # PointStamped
-        self.last_target_ns = 0
-
-        self.create_timer(1.0 / self.servo_hz, self._tick)
-
         self.get_logger().info(
-            f"VisualServo up | {self.servo_hz:.0f} Hz | lost_timeout="
-            f"{self.lost_timeout_ns/1e9:.1f}s")
+            f"VisualServo (passthrough) up | lost_timeout="
+            f"{self.lost_timeout_ns/1e9:.1f}s"
+        )
 
     def _on_target(self, msg: PointStamped):
-        self.last_target = msg
-        self.last_target_ns = self.get_clock().now().nanoseconds
-
-    def _tick(self):
-        if self.last_target is None:
-            return
-        age_ns = self.get_clock().now().nanoseconds - self.last_target_ns
-        if age_ns > self.lost_timeout_ns:
-            return  # held silent — gimbal holds its attitude
+        # Drop stale events (clock skew or stuck publisher)
+        msg_ns = msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec
+        if msg_ns > 0:
+            age_ns = self.get_clock().now().nanoseconds - msg_ns
+            if age_ns > self.lost_timeout_ns:
+                return
         out = PointStamped()
         out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = self.last_target.header.frame_id
-        out.point.x = self.last_target.point.x
-        out.point.y = self.last_target.point.y
-        out.point.z = self.last_target.point.z   # forward confidence as-is
+        out.header.frame_id = msg.header.frame_id
+        out.point.x = msg.point.x
+        out.point.y = msg.point.y
+        out.point.z = msg.point.z
         self.cmd_pub.publish(out)
 
 

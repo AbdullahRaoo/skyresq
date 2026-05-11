@@ -59,11 +59,12 @@ def generate_launch_description():
                               description="Detector backend: ncnn | onnx | ultralytics"),
         DeclareLaunchArgument("gst_pipeline",      default_value="",
                               description="Optional GStreamer pipeline for HW decode"),
-        # Skip visual_servo + run gimbal_controller at low rate when the
-        # gimbal protocol isn't wired yet (see docs/GIMBAL_PROTOCOL_NOTES.md).
-        # Bumps detector throughput ~3x by freeing CPU cores.
-        DeclareLaunchArgument("gimbal_active",     default_value="false",
-                              description="true once Z-1 Mini control protocol is fixed"),
+        # Z-1 Mini protocol bench-verified 2026-05-11; pitch + yaw both
+        # track commanded slews. visual_servo runs at 50 Hz so detections
+        # drive the gimbal in real time. Drop back to 'false' only for
+        # CPU-constrained dev sessions where the gimbal isn't needed.
+        DeclareLaunchArgument("gimbal_active",     default_value="true",
+                              description="Whether to actively drive the Z-1 Mini (50Hz + visual_servo)"),
     ]
 
     # ── MAVLink Bridge ────────────────────────────────────────────────
