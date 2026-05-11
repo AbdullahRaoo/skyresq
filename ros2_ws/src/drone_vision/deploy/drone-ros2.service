@@ -5,14 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=abdullah
-Group=abdullah
+User=pi
+Group=pi
 
 # Wait for /dev/serial0 and the gimbal/Pixhawk network to stabilise.
 ExecStartPre=/bin/sleep 8
 
 EnvironmentFile=/etc/default/drone-ros2
-ExecStart=/home/abdullah/Drone/ros2_ws/src/drone_vision/deploy/launch_drone.sh
+ExecStart=/home/pi/Drone/ros2_ws/src/drone_vision/deploy/launch_drone.sh
 
 # Restart policy — drone software MUST come back up on its own in the field
 Restart=on-failure

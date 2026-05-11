@@ -39,8 +39,10 @@ if TX is off — that's fine for the bench check.
 ### 1.2 ROS 2 pipeline
 
 ```bash
-# Start the pipeline manually (NOT via systemd yet)
-source /opt/ros/jazzy/setup.bash
+# Start the pipeline manually (NOT via systemd yet).
+# Source order on the Pi (RoboStack conda env):
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate ros_humble
 source ~/Drone/ros2_ws/install/setup.bash
 ros2 launch drone_vision hardware.launch.py gimbal_backend:=tcp
 ```

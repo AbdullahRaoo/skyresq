@@ -274,6 +274,11 @@ class GimbalControllerNode(Node):
                 if not chunk:
                     raise ConnectionResetError("gimbal closed connection")
                 buf.extend(chunk)
+            except socket.timeout:
+                # Gimbal isn't sending unsolicited state — totally normal.
+                # The outbound command timer keeps writing setpoints on a
+                # separate timer; we just keep listening.
+                continue
             except (OSError, ConnectionResetError) as exc:
                 self.get_logger().warning(f"Gimbal recv failed: {exc}")
                 try:
