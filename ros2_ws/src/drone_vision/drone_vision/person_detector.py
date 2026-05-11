@@ -157,6 +157,10 @@ class _NcnnBackend:
 
         self.net = ncnn.Net()
         self.net.opt.use_vulkan_compute = False             # CPU-only on Pi
+        # Pin to 3 threads on a Pi 4 — leaves one core for ROS executors,
+        # camera I/O, and the rest of the pipeline. ncnn would otherwise
+        # default to 1 thread under some Python wheels (~5x slowdown).
+        self.net.opt.num_threads = 3
         self.net.load_param(param_path)
         self.net.load_model(bin_path)
         self.imgsz = imgsz
