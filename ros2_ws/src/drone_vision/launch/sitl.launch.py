@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-SITL Launch File
-----------------
-Brings up the full simulation pipeline:
-  gz_camera_bridge   Gazebo /camera → ROS /drone/camera_raw
-  person_detector    YOLO26 inference, publishes /target_position
-  visual_servo       50 Hz pixel-error → /gimbal/cmd/look_at_pixel
-  gimbal_sim         virtual gimbal + ROI-cropped /drone/camera_raw_stabilised
-  mission_node       state machine
+SITL Launch File — ArduPilot SITL.
 
-The gimbal subsystem is observable but NOT yet wired into the mission
-state machine in PR-1a — mission_node still does its own NED-nudge
-TRACK behaviour. PR-1b switches the loop to use gimbal-aware tracking.
+Brings up the full simulation pipeline against a running ArduPilot SITL
+instance (sim_vehicle.py). No PX4, no Gazebo required.
 
-Prerequisites:
-  - PX4 SITL running with x500_mono_cam model.
-  - MicroXRCEAgent running on UDP 8888.
+Start ArduPilot SITL first:
+  cd ArduCopter
+  sim_vehicle.py -v ArduCopter --model=quad --console --map
+
+Then launch this file:
+  ros2 launch drone_vision sitl.launch.py
+
+For a real camera or video file instead of a test pattern:
+  ros2 launch drone_vision sitl.launch.py camera_url:=/dev/video0
+  ros2 launch drone_vision sitl.launch.py camera_url:=file:///path/to/test.mp4
+
+Nodes launched
+--------------
+  mavlink_bridge     ArduPilot SITL TCP → /vehicle/* ROS topics
+  gimbal_sim         Null/nadir gimbal sim + camera stabilised topic
+  visual_servo       50 Hz pixel-error republisher → /gimbal/cmd/look_at_pixel
+  person_detector    YOLO inference on stabilised camera feed
+  geo_localiser      Pixel + gimbal + pose → /target/world
+  gcs_link           /target/world → UDP JSON to SkyResQ GCS (optional)
 """
 import os
 from launch import LaunchDescription
@@ -23,56 +31,86 @@ from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 
-CONFIG_DIR = os.path.expanduser('~/Drone/ros2_ws/src/drone_vision/config')
-BRIDGE_CONFIG  = os.path.join(CONFIG_DIR, 'gz_bridge.yaml')
-GIMBAL_PARAMS  = os.path.join(CONFIG_DIR, 'gimbal_params.yaml')
-PAYLOAD_PARAMS = os.path.join(CONFIG_DIR, 'payload_params.yaml')
-MISSION_PARAMS = os.path.join(CONFIG_DIR, 'mission_params.yaml')
+CONFIG_DIR    = os.path.expanduser('~/Drone/ros2_ws/src/drone_vision/config')
+GIMBAL_PARAMS = os.path.join(CONFIG_DIR, 'gimbal_params.yaml')
 
-# venv site-packages — injected ONLY into the detector process so Qt-using
-# tools (rqt/rviz) in other terminals are never affected.
 VENV_SITE = os.path.expanduser('~/Drone/venv/lib/python3.12/site-packages')
 
 
 def generate_launch_description():
-    # === Arguments ===
-    conf_arg = DeclareLaunchArgument(
-        'confidence', default_value='0.45',
-        description='YOLO26 confidence threshold')
-    mode_arg = DeclareLaunchArgument(
-        'mode', default_value='search',
-        description="Mission mode: 'square' (test) or 'search' (follow targets)")
-    imgsz_arg = DeclareLaunchArgument(
-        'imgsz', default_value='640',
-        description='YOLO inference resolution (must match exported ONNX shape)')
 
-    # === Gazebo → ROS 2 camera bridge ===
-    gz_bridge = Node(
-        package='ros_gz_bridge',
-        executable='parameter_bridge',
-        name='gz_camera_bridge',
-        parameters=[{'config_file': BRIDGE_CONFIG}],
+    # ── Arguments ─────────────────────────────────────────────────────
+    args = [
+        DeclareLaunchArgument(
+            'sitl_connection', default_value='tcp:127.0.0.1:5760',
+            description='ArduPilot SITL MAVLink endpoint (TCP or UDP)'),
+        DeclareLaunchArgument(
+            'camera_url', default_value='',
+            description='Camera source: /dev/video0, file:///path/vid.mp4, or empty for test pattern'),
+        DeclareLaunchArgument(
+            'confidence', default_value='0.45',
+            description='YOLO confidence threshold'),
+        DeclareLaunchArgument(
+            'gcs_ip', default_value='127.0.0.1',
+            description='SkyResQ GCS IP for survivor cluster UDP packets'),
+        DeclareLaunchArgument(
+            'gcs_port', default_value='5005'),
+        DeclareLaunchArgument(
+            'imgsz', default_value='640',
+            description='YOLO inference resolution'),
+    ]
+
+    # ── MAVLink Bridge ────────────────────────────────────────────────
+    # Connects to ArduPilot SITL via TCP and publishes /vehicle/* topics.
+    # Identical to hardware; only connection_string differs.
+    mavlink_bridge = Node(
+        package='drone_vision',
+        executable='mavlink_bridge',
+        name='mavlink_bridge',
+        parameters=[{
+            'connection_string': LaunchConfiguration('sitl_connection'),
+            'stream_hz':         10,
+            'heartbeat_hz':      1.0,
+        }],
         output='screen',
     )
 
-    # === YOLO26 Person Detector ===
+    # ── Gimbal sim ────────────────────────────────────────────────────
+    # Virtual nadir gimbal + ROI-cropped stabilised camera topic.
+    # Accepts the camera_url arg to attach to a real video source.
+    gimbal_sim = Node(
+        package='drone_vision',
+        executable='gimbal_sim',
+        name='gimbal_sim',
+        parameters=[
+            GIMBAL_PARAMS,
+            {'image_topic': LaunchConfiguration('camera_url')},
+        ],
+        output='screen',
+    )
+
+    # ── Visual servo ──────────────────────────────────────────────────
+    visual_servo = Node(
+        package='drone_vision',
+        executable='visual_servo',
+        name='visual_servo',
+        output='screen',
+    )
+
+    # ── Person detector ───────────────────────────────────────────────
     existing_pp = os.environ.get('PYTHONPATH', '')
     detector_pythonpath = f"{VENV_SITE}:{existing_pp}" if existing_pp else VENV_SITE
-    detector = Node(
+
+    person_detector = Node(
         package='drone_vision',
         executable='person_detector',
         name='person_detector',
         parameters=[{
-            # PR-1b: detector reads the gimbaled view so visual_servo closes
-            # the loop. As the gimbal pans to centre the person, the pixel
-            # error in this stream goes to zero.
-            'image_topic': '/drone/camera_raw_stabilised',
+            'image_topic':          '/drone/camera_raw_stabilised',
             'confidence_threshold': LaunchConfiguration('confidence'),
-            'process_every_n': 3,
-            'imgsz': LaunchConfiguration('imgsz'),
-            # PR-4: backend selection. SITL stays on ultralytics (PC venv);
-            # the Pi's hardware.launch.py overrides to 'ncnn'.
-            'backend': 'ultralytics',
+            'process_every_n':      3,
+            'imgsz':                LaunchConfiguration('imgsz'),
+            'backend':              'ultralytics',
         }],
         additional_env={
             'PYTHONPATH': detector_pythonpath,
@@ -82,39 +120,7 @@ def generate_launch_description():
         output='screen',
     )
 
-    # === Visual servo (PR-1a) ===
-    # 50 Hz republisher. Bridges low-rate detector output to high-rate gimbal cmds.
-    visual_servo = Node(
-        package='drone_vision',
-        executable='visual_servo',
-        name='visual_servo',
-        output='screen',
-    )
-
-    # === Gimbal sim (PR-1a) ===
-    # Virtual 3-axis gimbal + ROI crop on the wide source camera.
-    gimbal_sim = Node(
-        package='drone_vision',
-        executable='gimbal_sim',
-        name='gimbal_sim',
-        parameters=[GIMBAL_PARAMS],
-        output='screen',
-    )
-
-    # === Mission Controller ===
-    mission = Node(
-        package='drone_vision',
-        executable='mission_node',
-        name='mission_node',
-        parameters=[
-            MISSION_PARAMS,
-            {'mode': LaunchConfiguration('mode')},
-        ],
-        output='screen',
-    )
-
-    # === Geo-localiser (PR-2a) ===
-    # Publishes /target/world. Consumed by mission_node v2 (PR-2b).
+    # ── Geo-localiser ─────────────────────────────────────────────────
     geo_localiser = Node(
         package='drone_vision',
         executable='geo_localiser',
@@ -122,26 +128,25 @@ def generate_launch_description():
         output='screen',
     )
 
-    # === Payload sim stub (PR-2b) ===
-    # Provides /payload/drop service with safety interlocks. Real (pigpio)
-    # backend lands in PR-3.
-    payload_sim = Node(
+    # ── GCS link ──────────────────────────────────────────────────────
+    # Sends survivor_cluster JSON to SkyResQ dashboard (loopback by default).
+    gcs_link = Node(
         package='drone_vision',
-        executable='payload_servo_sim',
-        name='payload_servo',
-        parameters=[PAYLOAD_PARAMS],
+        executable='gcs_link',
+        name='gcs_link',
+        parameters=[{
+            'gcs_ip':   LaunchConfiguration('gcs_ip'),
+            'gcs_port': LaunchConfiguration('gcs_port'),
+        }],
         output='screen',
     )
 
     return LaunchDescription([
-        conf_arg,
-        mode_arg,
-        imgsz_arg,
-        gz_bridge,
-        detector,
-        visual_servo,
+        *args,
+        mavlink_bridge,
         gimbal_sim,
-        mission,
+        visual_servo,
+        person_detector,
         geo_localiser,
-        payload_sim,
+        gcs_link,
     ])

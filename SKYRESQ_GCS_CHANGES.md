@@ -417,3 +417,220 @@ on the previous phases.
 - **3D / terrain-aware drop**. We use flat-earth + AGL from baro/GPS.
   Good enough for the demo and most SAR sites.
 - **Vendor-locked mobile app.** Stay browser/Electron.
+
+---
+
+## 7. Implementation gaps found in code review
+
+> These are stubs or missing handlers identified in the current dashboard
+> codebase. They must be filled before the features in §2 work end-to-end.
+
+### 7.1 Electron main process (`main.js`) — three stub IPC handlers
+
+**`mavlink-upload-mission`** (line ~100 in main.js):
+```js
+// CURRENT — does nothing real
+console.log(`[Main] Mission upload requested: ${waypoints.length} waypoints`);
+return { success: true, message: `${waypoints.length} waypoints ready` };
+```
+Needs the full ArduPilot mission upload handshake:
+1. Send `MISSION_COUNT` (count = waypoints.length, target = FC)
+2. Wait for `MISSION_REQUEST_INT` for each seq 0…N-1
+3. Reply with `MISSION_ITEM_INT` (lat/lon in 1e7 ints, alt in m, command from waypoint)
+4. Wait for `MISSION_ACK` (type == MAV_MISSION_ACCEPTED)
+5. Send `MAV_CMD_DO_SET_MISSION_CURRENT` seq=0 to arm the new mission
+
+**`mavlink-fly-to`** (main.js, after the upload handler):
+```js
+// CURRENT — logs coords, does nothing
+return { success: true, message: `Flying to ${lat.toFixed(6)}, ${lon.toFixed(6)}` };
+```
+Needs:
+1. Set mode to `GUIDED` (`set_mode(4)` for ArduCopter)
+2. Send `SET_POSITION_TARGET_GLOBAL_INT`:
+   - `type_mask = 0b110111111000` (position-only, ignore vel/accel/yaw)
+   - `coordinate_frame = MAV_FRAME_GLOBAL_RELATIVE_ALT_INT`
+   - `lat_int = lat * 1e7`, `lon_int = lon * 1e7`, `alt` in metres AGL
+
+**`mavlink-deploy-payload`**:
+```js
+// CURRENT — IPC channel registered in preload.js but NO handler in main.js at all
+```
+Needs:
+1. Run interlocks (armed, GUIDED, GPS fix ≥ 3, AGL in [1.5, 10] m, battery > 30 %)
+2. Send `MAV_CMD_DO_SET_SERVO` param1=servo_channel, param2=pwm_open_us
+3. Wait for COMMAND_ACK
+4. Schedule close: send same command with pwm_closed_us after open_hold_secs
+5. Return `{success, reason}` to renderer
+
+### 7.2 `GimbalControl.tsx` — UI only, no IPC
+
+The current component updates local state for pitch/yaw but the `applyPreset`
+callback has a `// TODO: Send MAV_CMD_DO_MOUNT_CONTROL via IPC` comment and
+does nothing. Add:
+```ts
+// In applyPreset:
+if (window.electron) {
+    window.electron.setGimbalAngle(p, y);  // new IPC channel needed
+}
+```
+And the corresponding `main.js` handler using `MAV_CMD_DO_MOUNT_CONTROL`:
+- param1 = pitch (deg)
+- param2 = 0 (roll)
+- param3 = yaw (deg)
+- param7 = 2 (MAV_MOUNT_MODE_MAVLINK_TARGETING)
+
+### 7.3 `backend/routers/commands.py` — missing `/api/goto`
+
+The survivors page (§2.2) and payload panel (§2.4) both reference a
+`/api/goto` endpoint that does not exist in `commands.py`. Add:
+```python
+class GotoRequest(BaseModel):
+    lat: float
+    lon: float
+    alt: float = 10.0  # metres AGL, capped server-side
+
+@router.post("/goto", response_model=CommandResponse)
+async def goto(request: GotoRequest) -> CommandResponse:
+    """Switch to GUIDED and fly to lat/lon/alt."""
+    ...
+```
+The handler mirrors the `mavlink-fly-to` IPC logic above but runs in the
+Python backend (for browser/web-serial mode). Both paths must exist.
+
+### 7.4 `backend/routers/telemetry_ws.py` — no UDP socket for Pi detections
+
+The backend currently only reads from the serial MAVLink connection. There is
+no code to open a UDP socket and receive the `detection_frame` /
+`survivor_cluster` JSON packets from the Pi. This is the single biggest
+missing piece for Phase 1. See §8.3 for the protocol spec.
+
+### 7.5 `electron/mavlink.js` — required in `main.js` but not in the repo
+
+`main.js` does `require('./electron/mavlink')` and wraps the `MAVLinkHandler`
+class. This file is not committed (likely in `.gitignore` or never written).
+It must be created alongside the IPC handlers above. Minimum API:
+```js
+class MAVLinkHandler {
+    connect(connectionString, baudRate) → Promise<{success, message}>
+    disconnect() → Promise<{success, message}>
+    arm() → Promise<{success, message}>
+    disarm() → Promise<{success, message}>
+    setMode(modeName) → Promise<{success, message}>
+    getConnectionProfiles() → Array<ConnectionProfile>
+    // New — required by §7.1, §7.2:
+    uploadMission(waypoints) → Promise<{success, message}>
+    flyTo(lat, lon, alt) → Promise<{success, message}>
+    deployPayload() → Promise<{success, message}>
+    setGimbalAngle(pitch, yaw) → Promise<{success, message}>
+}
+```
+
+---
+
+## 8. Recommendations on open design questions
+
+### 8.1 Video overlay — use Path B now, migrate to Path A post-demo
+
+**Recommendation: ship Path B (iframe + external overlay) for the demo.**
+
+The `VideoFeed.tsx` iframe points at `http://<pi-ip>:8889/skyresq_cam`.
+Switching to native `<video>` requires the Pi's mediamtx server to expose a
+WHEP endpoint. The current Pi config is unknown — adding WHEP may be trivial
+or may need a mediamtx upgrade and config change.
+
+For the demo, Path B is faster and lower risk:
+- Keep the `<iframe>` as-is
+- Add an absolutely-positioned `<div>` layer over it with `pointer-events: none`
+- Render cluster-centroid badges (not bbox outlines) on that layer —
+  cluster positions are in lat/lon, converted to video coordinates using the
+  gimbal's projection math (frames.py already has this)
+- Badge clicks work fine; only per-pixel bbox accuracy is lost
+
+Path A (native `<video>` + `<canvas>`) becomes the target once the Pi is
+confirmed to serve WHEP. Add this to the mediamtx config on the Pi:
+```yaml
+# /etc/mediamtx.yml — add under the path entry for skyresq_cam:
+paths:
+  skyresq_cam:
+    source: rtsp://192.168.144.108/...
+    webrtcEnabled: true          # already enabled for the iframe
+    webrtcICEHostNAT1To1IPs: []
+```
+WHEP endpoint will then be at:
+`http://<pi-ip>:8889/skyresq_cam/whep` — use that as the `<video>` `src`.
+
+### 8.2 Servo channel and PWM values
+
+**Recommendation: default to AUX1, make configurable via `.env`.**
+
+Add to the `.env` (and `backend/config.py`):
+```
+PAYLOAD_SERVO_CHANNEL=9       # AUX1 = ch 9 on ArduCopter
+PAYLOAD_PWM_OPEN_US=1900      # servo open (latch released)
+PAYLOAD_PWM_CLOSED_US=1100    # servo closed (latch held)
+PAYLOAD_OPEN_HOLD_S=3         # seconds to hold open
+```
+In `config.py`:
+```python
+payload_servo_channel: int = 9
+payload_pwm_open_us: int = 1900
+payload_pwm_closed_us: int = 1100
+payload_open_hold_s: float = 3.0
+```
+**Before first flight**: confirm the channel in Mission Planner under
+`SERVO9_FUNCTION` (should be set to `RCPassThru` or a specific servo type)
+and test the full open/close cycle on the bench with props off.
+
+### 8.3 Pi → GCS UDP protocol
+
+The Pi's `gcs_link` ROS node will send JSON packets to the GCS over UDP.
+Agreed protocol:
+
+| Parameter | Value |
+|---|---|
+| Pi sends to | `GCS_TAILSCALE_IP:5005` (configured in Pi's `.env`) |
+| GCS listens on | `0.0.0.0:5005` UDP |
+| Format | newline-delimited JSON (one JSON object per datagram) |
+| Max datagram size | 64 KB (well within UDP limit; `detection_frame` with 20 boxes ≈ 1 KB) |
+| Loss handling | UDP — loss is OK; stale `detection_frame` discarded by timestamp |
+| Auth | None for now (Tailscale provides network-layer auth) |
+
+Add to GCS `.env`:
+```
+PI_DETECTION_HOST=0.0.0.0
+PI_DETECTION_PORT=5005
+GCS_TAILSCALE_IP=100.123.87.26   # Pi's Tailscale IP (already in VideoFeed.tsx)
+```
+
+The GCS backend opens this socket in `telemetry_ws.py` lifespan and
+dispatches messages by `"type"` field:
+- `"survivor_cluster"` → `survivorStore` update + WebSocket broadcast
+- `"detection_frame"` → most-recent-only buffer + WebSocket broadcast
+- anything else → logged and dropped
+
+### 8.4 Demo mode — one codebase, one toggle
+
+**Recommendation: single codebase, `DEMO_MODE` toggle in the title bar.**
+
+Two separate codebases would diverge immediately and double maintenance
+burden. The demo-mode overlay approach from §2.5 is the right call:
+
+- `demoStore.ts` holds `demoMode: boolean` (persisted to `localStorage` so
+  a page refresh during the demo doesn't reset it)
+- A small "DEMO" badge in the title bar; clicking it toggles the mode
+  (requires clicking through a confirmation — can't accidentally enter demo
+  mode during a real mission)
+- Demo mode gates: 3 m altitude cap enforced server-side (the `/api/goto`
+  endpoint and the mission upload handler both clamp `alt` to 3.0 when
+  `settings.demo_mode` is `True`), pre-set 5×5 m search area, step-by-step
+  prompts panel, and constrained UI (fewer settings exposed)
+- `DEMO_MODE=true` can also be set in `.env` to hard-lock the GCS into demo
+  mode for an event (so it can't be accidentally toggled off)
+
+Add to `backend/config.py`:
+```python
+demo_mode: bool = False
+demo_max_alt_m: float = 3.0
+demo_search_radius_m: float = 5.0
+```

@@ -38,16 +38,14 @@ from pathlib import Path
 import yaml
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.qos import QoSProfile  # noqa: F401 — kept for potential caller use
 
 from geometry_msgs.msg import PointStamped, Vector3Stamped, PointStamped as _PtS
 from sensor_msgs.msg import NavSatFix
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, HomePosition
 
 from drone_msgs.msg import TargetWorld
 
 from drone_vision.geo.frames import (
-    px4_quat_to_yaw,
     pixel_to_world_ray,
     ground_intersect,
     ned_to_geo,
@@ -96,28 +94,22 @@ class GeoLocaliser(Node):
         self.home_lon_deg     = None
         self.home_alt_m       = 0.0
 
-        # ── QoS for PX4 topics (best-effort + transient-local) ─────────
-        px4_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1,
-        )
-
         # ── Subscriptions ──────────────────────────────────────────────
+        # /vehicle/* topics are published by mavlink_bridge (hardware) or
+        # px4_adapter (SITL) — geo_localiser is FC-agnostic.
         self.create_subscription(PointStamped, '/target_position',
                                  self._on_target, 10)
         self.create_subscription(Vector3Stamped, '/gimbal/state',
                                  self._on_gimbal, 10)
-        self.create_subscription(VehicleLocalPosition,
-                                 '/fmu/out/vehicle_local_position',
-                                 self._on_local_pos, px4_qos)
-        self.create_subscription(VehicleAttitude,
-                                 '/fmu/out/vehicle_attitude',
-                                 self._on_attitude, px4_qos)
-        self.create_subscription(HomePosition,
-                                 '/fmu/out/home_position',
-                                 self._on_home, px4_qos)
+        self.create_subscription(PointStamped,
+                                 '/vehicle/pose_ned',
+                                 self._on_local_pos, 10)
+        self.create_subscription(Vector3Stamped,
+                                 '/vehicle/attitude',
+                                 self._on_attitude, 10)
+        self.create_subscription(NavSatFix,
+                                 '/vehicle/home',
+                                 self._on_home, 10)
 
         # ── Publisher ──────────────────────────────────────────────────
         self.world_pub = self.create_publisher(TargetWorld, publish_topic, 10)
@@ -155,19 +147,20 @@ class GeoLocaliser(Node):
         self.gimbal_yaw_deg   = msg.vector.z
         self.gimbal_age       = time.monotonic()
 
-    def _on_local_pos(self, msg: VehicleLocalPosition):
-        self.drone_pos_ned = (msg.x, msg.y, msg.z)
+    def _on_local_pos(self, msg: PointStamped):
+        # x=north, y=east, z=NED z (negative above ground)
+        self.drone_pos_ned = (msg.point.x, msg.point.y, msg.point.z)
         self.drone_pos_age = time.monotonic()
 
-    def _on_attitude(self, msg: VehicleAttitude):
-        self.drone_yaw_rad = px4_quat_to_yaw(msg.q)
+    def _on_attitude(self, msg: Vector3Stamped):
+        # vector.z = yaw in radians (published by mavlink_bridge / px4_adapter)
+        self.drone_yaw_rad = msg.vector.z
         self.drone_yaw_age = time.monotonic()
 
-    def _on_home(self, msg: HomePosition):
-        # PX4 publishes deg-scaled lat/lon and float alt.
-        self.home_lat_deg = float(msg.lat)
-        self.home_lon_deg = float(msg.lon)
-        self.home_alt_m   = float(msg.alt)
+    def _on_home(self, msg: NavSatFix):
+        self.home_lat_deg = msg.latitude
+        self.home_lon_deg = msg.longitude
+        self.home_alt_m   = msg.altitude
 
     # ── Main: detection callback drives publication ────────────────────
 

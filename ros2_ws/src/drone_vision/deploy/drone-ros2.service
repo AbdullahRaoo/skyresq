@@ -1,0 +1,33 @@
+[Unit]
+Description=SkyResQ Drone — ROS 2 vision + MAVLink pipeline
+After=network-online.target multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=abdullah
+Group=abdullah
+
+# Wait for /dev/serial0 and the gimbal/Pixhawk network to stabilise.
+ExecStartPre=/bin/sleep 8
+
+EnvironmentFile=/etc/default/drone-ros2
+ExecStart=/home/abdullah/Drone/ros2_ws/src/drone_vision/deploy/launch_drone.sh
+
+# Restart policy — drone software MUST come back up on its own in the field
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=10
+StartLimitIntervalSec=120
+
+# Capture logs to systemd journal (journalctl -u drone-ros2 -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=drone-ros2
+
+# Stop signal: SIGINT first (lets rclpy clean up), then SIGKILL after 10 s
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

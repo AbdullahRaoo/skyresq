@@ -28,13 +28,14 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'person_detector = drone_vision.person_detector:main',
-            'mission_node = drone_vision.mission_node:main',
-            'gimbal_sim = drone_vision.gimbal.gimbal_sim:main',
-            'visual_servo = drone_vision.gimbal.visual_servo:main',
-            'geo_localiser = drone_vision.geo.geo_localiser:main',
-            'payload_servo_sim = drone_vision.payload.payload_servo_sim:main',
-            'payload_servo = drone_vision.payload.payload_servo_node:main',
+            'person_detector    = drone_vision.person_detector:main',
+            'gimbal_sim         = drone_vision.gimbal.gimbal_sim:main',
+            'gimbal_controller  = drone_vision.gimbal.gimbal_controller:main',
+            'rtsp_camera        = drone_vision.gimbal.rtsp_camera:main',
+            'visual_servo       = drone_vision.gimbal.visual_servo:main',
+            'geo_localiser      = drone_vision.geo.geo_localiser:main',
+            'mavlink_bridge     = drone_vision.bridge.mavlink_bridge:main',
+            'gcs_link           = drone_vision.bridge.gcs_link:main',
         ],
     },
 )
