@@ -19,6 +19,12 @@ UDP protocol (matches §8.3 of SKYRESQ_GCS_CHANGES.md)
   Format:      one JSON object per datagram, newline-terminated
   Loss:        UDP — acceptable; GCS handles gaps gracefully
 
+Packet types sent
+-----------------
+  survivor_cluster   on cluster create + every update_interval_s
+  detection_frame    on every Detection2DArray (~detector rate)
+  pi_status          1 Hz heartbeat with companion-computer health
+
 SiK fallback
 ------------
 If a pymavlink connection is provided via the mavlink_port / mavlink_baud
@@ -41,6 +47,7 @@ mavlink_baud       int    57600
 import hashlib
 import json
 import math
+import os
 import socket
 import time
 
@@ -48,8 +55,75 @@ import rclpy
 from rclpy.node import Node
 
 from drone_msgs.msg import TargetWorld
+from geometry_msgs.msg import Vector3Stamped
+from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
+from vision_msgs.msg import Detection2DArray
 
 EARTH_R = 6_371_000.0
+
+
+# ── Pi-side health helpers ───────────────────────────────────────────
+
+def _read_cpu_temp_c() -> float | None:
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.read().strip()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def _read_meminfo_mb() -> tuple[int, int]:
+    """Return (used_mb, total_mb). (0, 0) if unavailable."""
+    try:
+        total = available = 0
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                v = v.strip().split()
+                if not v:
+                    continue
+                kb = int(v[0])
+                if k == "MemTotal":
+                    total = kb
+                elif k == "MemAvailable":
+                    available = kb
+        if total:
+            return ((total - available) // 1024, total // 1024)
+    except (OSError, ValueError):
+        pass
+    return (0, 0)
+
+
+def _read_load1() -> float:
+    try:
+        return os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return 0.0
+
+
+class _RateCounter:
+    """Counts messages seen in a rolling 2 s window for FPS estimation."""
+
+    __slots__ = ("_stamps",)
+
+    def __init__(self) -> None:
+        self._stamps: list[float] = []
+
+    def tick(self) -> None:
+        now = time.monotonic()
+        self._stamps.append(now)
+        cutoff = now - 2.0
+        # Trim from the front — list is already monotonically increasing
+        while self._stamps and self._stamps[0] < cutoff:
+            self._stamps.pop(0)
+
+    def fps(self) -> float:
+        return len(self._stamps) / 2.0 if self._stamps else 0.0
+
+    @property
+    def last_seen(self) -> float:
+        return self._stamps[-1] if self._stamps else 0.0
 
 
 def _haversine_m(lat1, lon1, lat2, lon2):
@@ -113,6 +187,9 @@ class GcsLinkNode(Node):
         self.declare_parameter("confidence_min",    0.50)
         self.declare_parameter("mavlink_port",      "")
         self.declare_parameter("mavlink_baud",      57600)
+        self.declare_parameter("stream_width",      1280)
+        self.declare_parameter("stream_height",     720)
+        self.declare_parameter("status_period_s",   1.0)
 
         self._gcs_ip   = self.get_parameter("gcs_ip").value
         self._gcs_port = int(self.get_parameter("gcs_port").value)
@@ -121,10 +198,23 @@ class GcsLinkNode(Node):
         self._conf_min = float(self.get_parameter("confidence_min").value)
         mav_port       = self.get_parameter("mavlink_port").value
         mav_baud       = int(self.get_parameter("mavlink_baud").value)
+        self._stream_w = int(self.get_parameter("stream_width").value)
+        self._stream_h = int(self.get_parameter("stream_height").value)
+        status_period  = float(self.get_parameter("status_period_s").value)
 
         self._clusters:  dict[str, _Cluster] = {}
         self._last_send: dict[str, float]    = {}
         self._link_ok = True
+        self._start_t = time.monotonic()
+
+        # Health trackers — populated by the *_seen subscriptions
+        self._detector_rate = _RateCounter()
+        self._camera_rate   = _RateCounter()
+        self._gimbal_rate   = _RateCounter()
+        self._fc_rate       = _RateCounter()
+        self._gimbal_pitch  = 0.0
+        self._gimbal_yaw    = 0.0
+        self._fc_armed      = False
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
@@ -144,6 +234,15 @@ class GcsLinkNode(Node):
                 self._mav = None
 
         self.create_subscription(TargetWorld, "/target/world", self._on_target, 10)
+        self.create_subscription(
+            Detection2DArray, "/detections", self._on_detection_frame, 10
+        )
+        self.create_subscription(Image, "/drone/camera_raw", self._on_camera, 1)
+        self.create_subscription(Vector3Stamped, "/gimbal/state", self._on_gimbal, 10)
+        self.create_subscription(Bool, "/vehicle/armed", self._on_armed, 10)
+
+        # 1 Hz Pi-status heartbeat (operator sees companion health)
+        self.create_timer(status_period, self._send_pi_status)
 
         # Periodic SiK heartbeat and status (1 Hz)
         if self._mav:
@@ -151,7 +250,8 @@ class GcsLinkNode(Node):
 
         self.get_logger().info(
             f"GCS link ready → {self._gcs_ip}:{self._gcs_port} | "
-            f"cluster_r={self._radius_m} m | conf≥{self._conf_min}"
+            f"cluster_r={self._radius_m} m | conf≥{self._conf_min} | "
+            f"stream={self._stream_w}x{self._stream_h}"
         )
 
     # ── Detection callback ─────────────────────────────────────────────
@@ -184,6 +284,125 @@ class GcsLinkNode(Node):
             if now - self._last_send.get(cluster.id, 0.0) >= self._upd_s:
                 self._send_cluster(cluster)
 
+    # ── detection_frame forwarding ────────────────────────────────────
+
+    def _on_detection_frame(self, msg: Detection2DArray):
+        """Forward raw YOLO bboxes to the GCS for live video overlay."""
+        self._detector_rate.tick()
+        if not msg.detections:
+            return
+
+        det_list = []
+        for d in msg.detections:
+            cx = d.bbox.center.position.x
+            cy = d.bbox.center.position.y
+            w  = d.bbox.size_x
+            h  = d.bbox.size_y
+            x1 = max(0.0, cx - w / 2.0)
+            y1 = max(0.0, cy - h / 2.0)
+            x2 = cx + w / 2.0
+            y2 = cy + h / 2.0
+
+            conf = 0.0
+            cls  = "person"
+            if d.results:
+                conf = float(d.results[0].hypothesis.score)
+                cls  = d.results[0].hypothesis.class_id or "person"
+
+            det_list.append({
+                "bbox":       [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+                "confidence": round(conf, 3),
+                "class":      cls,
+                "cluster_id": None,
+            })
+
+        stamp_ms = msg.header.stamp.sec * 1000 + msg.header.stamp.nanosec // 1_000_000
+        packet = {
+            "type":          "detection_frame",
+            "frame_ts_ms":   stamp_ms,
+            "stream_width":  self._stream_w,
+            "stream_height": self._stream_h,
+            "detections":    det_list,
+        }
+        self._send_json(packet)
+
+    # ── Health tracker callbacks ──────────────────────────────────────
+
+    def _on_camera(self, _msg: Image):
+        # Use the message to learn the actual stream size on first arrival
+        if (_msg.width and _msg.height
+                and (_msg.width != self._stream_w or _msg.height != self._stream_h)):
+            self._stream_w = int(_msg.width)
+            self._stream_h = int(_msg.height)
+            self.get_logger().info(
+                f"stream size learnt from /drone/camera_raw: "
+                f"{self._stream_w}x{self._stream_h}"
+            )
+        self._camera_rate.tick()
+
+    def _on_gimbal(self, msg: Vector3Stamped):
+        self._gimbal_rate.tick()
+        self._gimbal_pitch = float(msg.vector.y)
+        self._gimbal_yaw   = float(msg.vector.z)
+
+    def _on_armed(self, msg: Bool):
+        self._fc_rate.tick()
+        self._fc_armed = bool(msg.data)
+
+    # ── pi_status (1 Hz) ──────────────────────────────────────────────
+
+    def _send_pi_status(self):
+        now    = time.monotonic()
+        uptime = int(now - self._start_t)
+
+        ram_used, ram_total = _read_meminfo_mb()
+
+        def _fresh(counter: _RateCounter, max_age_s: float) -> bool:
+            return counter.last_seen > 0 and (now - counter.last_seen) <= max_age_s
+
+        packet = {
+            "type":          "pi_status",
+            "ts_ms":         int(time.time() * 1000),
+            "uptime_s":      uptime,
+            "cpu_temp_c":    _read_cpu_temp_c(),
+            "cpu_load1":     round(_read_load1(), 2),
+            "ram_used_mb":   ram_used,
+            "ram_total_mb": ram_total,
+            "detector": {
+                "ok":          _fresh(self._detector_rate, 5.0),
+                "fps":         round(self._detector_rate.fps(), 1),
+            },
+            "camera": {
+                "ok":          _fresh(self._camera_rate, 2.0),
+                "fps":         round(self._camera_rate.fps(), 1),
+            },
+            "gimbal": {
+                "ok":          _fresh(self._gimbal_rate, 2.0),
+                "pitch_deg":   round(self._gimbal_pitch, 1),
+                "yaw_deg":     round(self._gimbal_yaw, 1),
+            },
+            "fc_link": {
+                "ok":          _fresh(self._fc_rate, 3.0),
+                "armed":       self._fc_armed,
+            },
+            "gcs_link": {
+                "ok":          self._link_ok,
+            },
+            "cluster_count": len(self._clusters),
+        }
+        self._send_json(packet)
+
+    # ── UDP send (shared) ─────────────────────────────────────────────
+
+    def _send_json(self, obj: dict) -> None:
+        payload = (json.dumps(obj) + "\n").encode()
+        try:
+            self._sock.sendto(payload, (self._gcs_ip, self._gcs_port))
+            self._link_ok = True
+        except OSError as exc:
+            self._link_ok = False
+            self.get_logger().debug(f"UDP send failed: {exc}")
+
     # ── Clustering ─────────────────────────────────────────────────────
 
     def _nearest_cluster(self, lat, lon):
@@ -199,14 +418,9 @@ class GcsLinkNode(Node):
     # ── UDP send ───────────────────────────────────────────────────────
 
     def _send_cluster(self, cluster: _Cluster):
-        payload = (json.dumps(cluster.to_dict()) + "\n").encode()
-        try:
-            self._sock.sendto(payload, (self._gcs_ip, self._gcs_port))
-            self._link_ok = True
+        self._send_json(cluster.to_dict())
+        if self._link_ok:
             self._last_send[cluster.id] = time.monotonic()
-        except OSError as exc:
-            self._link_ok = False
-            self.get_logger().warning(f"UDP send failed: {exc}")
 
     # ── SiK fallback (optional 1 Hz) ──────────────────────────────────
 

@@ -73,6 +73,46 @@ arrives in <200 ms.
 - `NAMED_VALUE_INT` on `cluster_count`, `current_state` (mission state),
   `link_4g_ok`. Keeps the dashboard informed even when 4G drops.
 
+### 1.4 Pi status (NEW — 1 Hz heartbeat over UDP :5005)
+```jsonc
+{
+  "type": "pi_status",
+  "ts_ms": 1747043820000,
+  "uptime_s": 312,
+  "cpu_temp_c": 58.2,                  // null if /sys/class/thermal unreadable
+  "cpu_load1": 0.47,                   // 1-min load average
+  "ram_used_mb": 1840,
+  "ram_total_mb": 4096,
+  "detector": { "ok": true, "fps": 8.4 },
+  "camera":   { "ok": true, "fps": 24.0 },
+  "gimbal":   { "ok": true, "pitch_deg": -90.0, "yaw_deg": 0.0 },
+  "fc_link":  { "ok": true, "armed": false },
+  "gcs_link": { "ok": true },
+  "cluster_count": 3
+}
+```
+Sent every `status_period_s` (default 1.0). The `ok` flags drop to `false`
+when the upstream topic has been silent for 2–5 s — they're how the
+operator sees companion-side failures (overheated Pi, dead camera, gimbal
+disconnect, FC link loss) without SSHing in. Suggested UI: a "Pi" badge in
+the title bar that goes red/yellow/green based on the worst flag, with a
+tooltip showing the JSON.
+
+### 1.5 MAVLink mirror on UDP :14550 (NEW)
+The Pi's `mavlink_bridge` opens a UDP socket and rebroadcasts every frame
+received from the FC to `<gcs_ip>:14550`. Anything the GCS sends to UDP
+`14551` on the Pi is written straight to the FC serial.
+
+This is **the same MAVLink protocol** the SiK radio carries — the only
+difference is the transport. The dashboard's existing `udp:100.64.0.1:14550`
+connection profile points at this. No new packet parser required.
+
+Operational pattern:
+- **Primary** telemetry: the 4G/Tailscale MAVLink stream at 10 Hz
+- **Backup** telemetry: SiK MAVLink at 4 Hz when 4G is dead
+
+See §8.5 for the connection-failover logic the dashboard should implement.
+
 ---
 
 ## 2. New UI surfaces
@@ -634,3 +674,55 @@ demo_mode: bool = False
 demo_max_alt_m: float = 3.0
 demo_search_radius_m: float = 5.0
 ```
+
+### 8.5 Two-channel telemetry — 4G primary, SiK backup
+
+**The drone now sends MAVLink over both SiK and 4G simultaneously.**
+The dashboard should prefer whichever has fresher heartbeats and fall
+back automatically when one goes silent.
+
+```ts
+// Pseudo-code for the failover state machine
+type Link = { name: 'sik' | 'udp', last_hb_ms: number, connected: boolean };
+
+function pickActiveLink(sik: Link, udp: Link): Link {
+    const FRESH = 1500;  // ms — a link is "fresh" if a heartbeat arrived this recently
+    const now = Date.now();
+    const sikFresh = (now - sik.last_hb_ms) < FRESH;
+    const udpFresh = (now - udp.last_hb_ms) < FRESH;
+
+    if (udpFresh) return udp;        // prefer 4G when both are alive
+    if (sikFresh) return sik;        // fall back to SiK
+    return udp.connected ? udp : sik; // both stale — keep the connected one
+}
+```
+
+**Why prefer UDP/4G when both are alive:**
+- 10 Hz update rate (vs 4 Hz on SiK)
+- No 433/915 MHz multipath dropouts
+- Lower latency (~50 ms vs ~200 ms)
+- Same data, no parser changes
+
+**Recommended UI surface:** a tiny pair of dots in the title bar:
+```
+●—— 4G  10Hz   ←active
+●—— SiK 4 Hz
+```
+Both green when alive, red when stale > 1.5 s. Clicking either dot
+toggles a "force this link" override that disables the auto-switch
+(useful for testing).
+
+**On the Pi side**, both paths share the same FC serial connection so
+arming/mode commands sent over either channel reach the FC. The dashboard
+can keep using the SiK serial port for commands (its existing path) and
+just **listen** on the UDP socket — that's the lowest-friction migration.
+
+### 8.6 detection_frame is now live
+
+`detection_frame` packets (§1.2) start flowing as soon as the Pi
+pipeline is running. They arrive at the detector rate (~5–10 Hz) and
+contain bbox lists in source-camera pixel coordinates with
+`stream_width` and `stream_height` populated from the actual RTSP
+frame. The GCS can switch from Path B (cluster badges only) to Path A
+(per-detection bbox outlines + clickable cluster badges) without
+waiting on any Pi-side work.

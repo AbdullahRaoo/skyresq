@@ -61,15 +61,20 @@ def generate_launch_description():
     ]
 
     # ── MAVLink Bridge ────────────────────────────────────────────────
+    # Forwards FC MAVLink to <gcs_ip>:14550 over Tailscale so the dashboard
+    # can use the 4G link as primary telemetry (SiK becomes auto fallback).
     mavlink_bridge = Node(
         package="drone_vision",
         executable="mavlink_bridge",
         name="mavlink_bridge",
         parameters=[{
-            "connection_string": LaunchConfiguration("connection_string"),
-            "baud_rate":         LaunchConfiguration("baud_rate"),
-            "stream_hz":         10,
-            "heartbeat_hz":      1.0,
+            "connection_string":   LaunchConfiguration("connection_string"),
+            "baud_rate":           LaunchConfiguration("baud_rate"),
+            "stream_hz":           10,
+            "heartbeat_hz":        1.0,
+            "gcs_forward_ip":      LaunchConfiguration("gcs_ip"),
+            "gcs_forward_port":    14550,
+            "gcs_forward_listen":  14551,
         }],
         output="screen",
     )

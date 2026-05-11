@@ -24,9 +24,18 @@ baud_rate          int    57600                    Baud rate — ignored for TCP
 target_sysid       int    1                        ArduCopter system ID
 heartbeat_hz       float  1.0                      Rate to send GCS heartbeat to FC
 stream_hz          int    10                       Rate to request from FC (REQUEST_DATA_STREAM)
+
+# 4G/Tailscale MAVLink mirror — Pi rebroadcasts FC MAVLink to GCS via UDP.
+# Lets the SkyResQ dashboard use the 4G link as the primary telemetry path
+# (with SiK as automatic fallback) so the operator gets 10 Hz updates with
+# minimal packet loss instead of 4 Hz over SiK 433 MHz.
+gcs_forward_ip      str    ""                      Target GCS IP — leave empty to disable forwarding
+gcs_forward_port    int    14550                   Standard MAVLink UDP port on the GCS
+gcs_forward_listen  int    14551                   Local UDP bind port for GCS→FC commands
 """
 
 import math
+import socket
 import threading
 import time
 
@@ -61,17 +70,23 @@ class MavlinkBridgeNode(Node):
     def __init__(self):
         super().__init__("mavlink_bridge")
 
-        self.declare_parameter("connection_string", "/dev/serial0")
-        self.declare_parameter("baud_rate",         57600)
-        self.declare_parameter("target_sysid",      1)
-        self.declare_parameter("heartbeat_hz",      1.0)
-        self.declare_parameter("stream_hz",         10)
+        self.declare_parameter("connection_string",   "/dev/serial0")
+        self.declare_parameter("baud_rate",           57600)
+        self.declare_parameter("target_sysid",        1)
+        self.declare_parameter("heartbeat_hz",        1.0)
+        self.declare_parameter("stream_hz",           10)
+        self.declare_parameter("gcs_forward_ip",      "")
+        self.declare_parameter("gcs_forward_port",    14550)
+        self.declare_parameter("gcs_forward_listen",  14551)
 
         port      = self.get_parameter("connection_string").value
         baud      = int(self.get_parameter("baud_rate").value)
         self._sysid  = int(self.get_parameter("target_sysid").value)
         hb_hz     = float(self.get_parameter("heartbeat_hz").value)
         stream_hz = int(self.get_parameter("stream_hz").value)
+        self._fwd_ip   = self.get_parameter("gcs_forward_ip").value
+        self._fwd_port = int(self.get_parameter("gcs_forward_port").value)
+        fwd_listen     = int(self.get_parameter("gcs_forward_listen").value)
 
         # ── Publishers ─────────────────────────────────────────────────
         self._pub_att  = self.create_publisher(Vector3Stamped, "/vehicle/attitude", 10)
@@ -132,9 +147,32 @@ class MavlinkBridgeNode(Node):
         self._hb_interval = 1.0 / max(hb_hz, 0.5)
         self._last_hb_t   = 0.0
 
+        # ── GCS UDP forward (optional) ─────────────────────────────────
+        self._fwd_sock: socket.socket | None = None
+        self._fwd_thread: threading.Thread | None = None
+        if self._fwd_ip:
+            self._fwd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                self._fwd_sock.bind(("0.0.0.0", fwd_listen))
+                self._fwd_sock.settimeout(0.2)
+                self.get_logger().info(
+                    f"MAVLink mirror → {self._fwd_ip}:{self._fwd_port} "
+                    f"(listening on UDP {fwd_listen} for GCS→FC)"
+                )
+            except OSError as exc:
+                self.get_logger().warning(
+                    f"GCS forward disabled — could not bind UDP {fwd_listen}: {exc}"
+                )
+                self._fwd_sock = None
+
         self._stop   = threading.Event()
         self._thread = threading.Thread(target=self._mavlink_loop, daemon=True)
         self._thread.start()
+
+        if self._fwd_sock is not None:
+            self._fwd_thread = threading.Thread(target=self._gcs_to_fc_loop, daemon=True)
+            self._fwd_thread.start()
+
         self.get_logger().info("MAVLink bridge running")
 
     def destroy_node(self):
@@ -162,6 +200,15 @@ class MavlinkBridgeNode(Node):
             if msg_type == "BAD_DATA":
                 continue
 
+            # Mirror the raw frame to the GCS over UDP (Tailscale)
+            if self._fwd_sock is not None:
+                try:
+                    raw = msg.get_msgbuf()
+                    if raw:
+                        self._fwd_sock.sendto(bytes(raw), (self._fwd_ip, self._fwd_port))
+                except OSError:
+                    pass   # transient — next packet will retry
+
             if msg_type == "ATTITUDE":
                 self._handle_attitude(msg)
             elif msg_type == "GLOBAL_POSITION_INT":
@@ -171,6 +218,38 @@ class MavlinkBridgeNode(Node):
             elif msg_type == "HEARTBEAT":
                 if msg.get_srcSystem() == self._sysid:
                     self._handle_heartbeat(msg)
+
+    # ── GCS → FC forwarder (background thread) ────────────────────────
+    #
+    # Anything the GCS sends to UDP gcs_forward_listen is treated as raw
+    # MAVLink bytes and written straight through to the FC serial. This is
+    # how the SkyResQ dashboard commands the drone (ARM / MODE / GOTO) over
+    # the 4G link.
+
+    def _gcs_to_fc_loop(self):
+        while not self._stop.is_set():
+            try:
+                data, addr = self._fwd_sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                self.get_logger().debug(f"UDP recv error: {exc}")
+                time.sleep(0.1)
+                continue
+
+            if not data:
+                continue
+
+            try:
+                # Write raw bytes to the underlying pymavlink connection.
+                # write() handles both serial and TCP/UDP transports.
+                self._mav.write(data)
+                # Latch the GCS endpoint we last heard from. Useful if the
+                # parameter was empty and someone is probing us.
+                if not self._fwd_ip:
+                    self._fwd_ip = addr[0]
+            except Exception as exc:
+                self.get_logger().warning(f"FC write failed: {exc}")
 
     # ── Message handlers ───────────────────────────────────────────────
 
