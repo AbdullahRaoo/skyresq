@@ -25,21 +25,37 @@ pitch_min_deg      float  -90.0
 pitch_max_deg      float  +30.0
 reconnect_s        float  2.0
 
-XFRobot framing (preliminary — verify against AP_Mount_XFRobot.cpp on first bench test)
---------------------------------------------------------------------------------------
-  Out: [0xA8, 0xE5, 0x02, len_lo, len_hi, order, ...payload..., crc_lo, crc_hi]
-  In:  [0x8A, 0x5E, 0x02, len_lo, len_hi, order, ...payload..., crc_lo, crc_hi]
-  Order codes:
-    0x14  EULER_ANGLE_CONTROL    (pitch, yaw, roll — int16 centi-deg, little-endian)
-    0x10  ANGLE
-    0x12  HEAD_FOLLOW
-    0x17  TRACK
-    0x1A  CLICK_TO_AIM
-    0x20  SHUTTER
-    0x21  RECORD
-    0x25  ZOOM_RATE
-    0x75  TARGET_DETECTION_TOGGLE
-  CRC: CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no xor-out)
+XFRobot framing (verified against ArduPilot AP_Mount_XFRobot.cpp)
+-----------------------------------------------------------------
+  Out header: 0xA8 0xE5      In header: 0x8A 0x5E      Version: 0x02
+
+  Every command (including ANGLE_CONTROL) shares one 72-byte frame:
+    bytes 0-1   header (0xA8, 0xE5)
+    bytes 2-3   length uint16 LE = 72
+    byte  4     version = 0x02
+    bytes 5-6   roll_control  int16 LE centi-deg (-18000..+18000)
+    bytes 7-8   pitch_control int16 LE centi-deg (-9000..+9000)
+    bytes 9-10  yaw_control   int16 LE centi-deg (-18000..+18000)
+    byte 11     status — Bit0:INS valid, Bit2:control values valid
+    bytes 12-23 vehicle attitude (3x int16 centi-deg) + accel (3x int16 cm/s²)
+    bytes 24-29 vehicle velocity NED (3x int16 decimeter/s)
+    byte 30     request_code = 0x01 (asks gimbal to return sub-frame)
+    bytes 31-36 reserved (zeros)
+    byte 37     sub_header = 0x01
+    bytes 38-49 vehicle lat/lon/alt (3x int32 — lat/lon 1e7, alt mm AMSL)
+    byte 50     gps_num_sats uint8
+    bytes 51-54 gps_week_ms uint32 LE
+    bytes 55-56 gps_week    uint16 LE
+    bytes 57-60 alt_rel int32 LE (mm above home)
+    bytes 61-68 reserved2 (zeros)
+    byte 69     order code (0x10 = ANGLE_CONTROL)
+    bytes 70-71 CRC-16/XMODEM (poly 0x1021, init 0, no reflection) HIGH byte first
+
+  Inbound reply packets have the same 4-byte header+length prefix but a
+  different main+sub body shape — we only need three fields from it:
+    bytes 18-19 roll_abs_cd  int16 LE centi-deg
+    bytes 20-21 pitch_abs_cd int16 LE centi-deg
+    bytes 22-23 yaw_abs_cd   uint16 LE centi-deg (0..36000)
 """
 
 import math
@@ -59,15 +75,29 @@ HDR_OUT = bytes([0xA8, 0xE5])
 HDR_IN  = bytes([0x8A, 0x5E])
 PROTO_VERSION = 0x02
 
-ORDER_EULER_ANGLE_CONTROL = 0x14
-ORDER_TRACK               = 0x17
+# Function-order codes (subset — see AP_Mount_XFRobot.h for full list)
+ORDER_ANGLE_CONTROL  = 0x10
+ORDER_HEAD_FOLLOW    = 0x12
+ORDER_TRACK          = 0x17
+ORDER_CLICK_TO_AIM   = 0x1A
+ORDER_SHUTTER        = 0x20
 
-# CRC-16/CCITT-FALSE
+# Status byte bits inside the send packet (byte 11)
+STATUS_INS_VALID     = 1 << 0
+STATUS_CTRL_VALID    = 1 << 2
+
+# Send packet has fixed 72-byte size (70 main+sub frame + 2 CRC)
+SEND_PACKET_SIZE = 72
+# struct.pack format for the 70-byte main+sub frame (no CRC); little-endian.
+# Counts: 2+2+1+6+1+6+6+6+1+6+1+4+4+4+1+4+2+4+8+1 = 70
+_MAIN_FMT = "<BBHBhhhBhhhhhhhhhB6xBiiiBIHi8xB"
+
+# CRC-16/XMODEM (poly 0x1021, init 0, no reflection, no xor-out)
 _CRC_POLY = 0x1021
-_CRC_INIT = 0xFFFF
+_CRC_INIT = 0x0000
 
 
-def _crc16_ccitt(data: bytes) -> int:
+def _crc16_xmodem(data: bytes) -> int:
     crc = _CRC_INIT
     for byte in data:
         crc ^= byte << 8
@@ -77,59 +107,90 @@ def _crc16_ccitt(data: bytes) -> int:
     return crc
 
 
-def build_euler_angle_packet(pitch_deg: float, yaw_deg: float, roll_deg: float = 0.0) -> bytes:
-    """Build an EULER_ANGLE_CONTROL (0x14) command packet."""
-    payload = struct.pack(
-        "<hhh",
-        int(round(pitch_deg * 100)),
-        int(round(yaw_deg   * 100)),
-        int(round(roll_deg  * 100)),
+def build_angle_control_packet(
+    pitch_deg: float,
+    yaw_deg:   float,
+    roll_deg:  float = 0.0,
+) -> bytes:
+    """Build a 72-byte ANGLE_CONTROL (0x10) packet for the Z-1 Mini.
+
+    No vehicle telemetry (INS bit not set) — gimbal will use its own IMU.
+    For full-FC integration the AHRS / GPS fields can be filled in.
+    """
+    roll_cd  = max(-18000, min(18000, int(round(roll_deg  * 100))))
+    pitch_cd = max( -9000, min( 9000, int(round(pitch_deg * 100))))
+    yaw_cd   = max(-18000, min(18000, int(round(yaw_deg   * 100))))
+
+    main = struct.pack(
+        _MAIN_FMT,
+        HDR_OUT[0], HDR_OUT[1],     # header1, header2
+        SEND_PACKET_SIZE,            # length (total packet bytes incl CRC)
+        PROTOCOL_VERSION_BYTE,       # version
+        roll_cd, pitch_cd, yaw_cd,   # control values (centi-deg)
+        STATUS_CTRL_VALID,           # status — only "control valid"
+        0, 0, 0,                     # vehicle abs roll/pitch/yaw (no INS)
+        0, 0, 0,                     # accel N/E/U
+        0, 0, 0,                     # vel N/E/U
+        0x01,                        # request_code — ask for sub-frame reply
+        0x01,                        # sub_header
+        0, 0, 0,                     # lon, lat, alt_amsl (no GPS)
+        0,                           # gps_num_sats
+        0, 0,                        # gps_week_ms, gps_week
+        0,                           # alt_rel
+        ORDER_ANGLE_CONTROL,         # byte 69: order
     )
-    body = (
-        bytes([PROTO_VERSION])
-        + struct.pack("<H", 1 + len(payload))   # length = order byte + payload
-        + bytes([ORDER_EULER_ANGLE_CONTROL])
-        + payload
-    )
-    crc = _crc16_ccitt(body)
-    return HDR_OUT + body + struct.pack("<H", crc)
+    assert len(main) == 70, f"main frame size mismatch: {len(main)}"
+    crc = _crc16_xmodem(main)
+    # CRC is HIGH byte first then LOW byte (NOT little-endian as a uint16)
+    return main + bytes([(crc >> 8) & 0xFF, crc & 0xFF])
+
+
+# Convenience constant referenced inside build_angle_control_packet
+PROTOCOL_VERSION_BYTE = PROTO_VERSION
 
 
 def parse_state_packet(buf: bytearray):
     """
     Try to extract one inbound packet from a streaming buffer.
 
-    Returns (consumed_bytes, parsed_dict_or_None). The parsed dict carries
-    {"order": int, "payload": bytes} when a full valid packet is found.
-    Bytes before HDR_IN are discarded. Returns (0, None) if not enough data.
+    The Z-1 Mini's reply frame is also length-prefixed at bytes 2-3
+    (uint16 LE = total packet size). We pull the cached camera attitude
+    out of bytes 18-23 (roll_abs_cd, pitch_abs_cd, yaw_abs_cd as int16/uint16
+    centi-degrees).
+
+    Returns (consumed_bytes, parsed_dict_or_None) per parser convention.
     """
     idx = buf.find(HDR_IN)
     if idx < 0:
-        # No header in buffer — drop everything except the last byte
-        # (which might be the first byte of a header at the boundary)
+        # No header — discard all but the last byte (could be partial header)
         return max(0, len(buf) - 1), None
     if idx > 0:
-        # Discard pre-header garbage
         return idx, None
 
-    # We have HDR_IN at offset 0; need at least 5 header bytes (header+ver+len)
-    if len(buf) < 5:
+    # Header found at offset 0. Need at least 4 bytes to read length.
+    if len(buf) < 4:
         return 0, None
 
-    length = struct.unpack_from("<H", buf, 3)[0]   # length covers order + payload
-    total  = 2 + 1 + 2 + length + 2                # hdr + ver + len + body + crc
+    total = struct.unpack_from("<H", buf, 2)[0]    # length = whole packet
+    if total < 24 or total > 200:
+        # Sanity check — drop the header byte and resync
+        return 1, None
     if len(buf) < total:
         return 0, None
 
-    body = bytes(buf[2:2 + 1 + 2 + length])
-    crc_pkt = struct.unpack_from("<H", buf, 2 + 1 + 2 + length)[0]
-    if _crc16_ccitt(body) != crc_pkt:
-        # Bad CRC — drop the header and keep scanning
-        return 1, None
+    body = bytes(buf[: total - 2])
+    crc_pkt = (buf[total - 2] << 8) | buf[total - 1]   # HIGH byte first
+    if _crc16_xmodem(body) != crc_pkt:
+        return 1, None    # Bad CRC, drop header and re-sync
 
-    order   = body[3]
-    payload = body[4:]
-    return total, {"order": order, "payload": payload}
+    # Camera attitude — int16 centi-degrees at bytes 18-19, 20-21, 22-23
+    roll_cd, pitch_cd, yaw_cd = struct.unpack_from("<hhH", buf, 18)
+    return total, {
+        "roll_deg":  roll_cd  / 100.0,
+        "pitch_deg": pitch_cd / 100.0,
+        "yaw_deg":   yaw_cd   / 100.0,   # 0..360 unsigned
+        "raw_order": buf[69] if total > 70 else None,
+    }
 
 
 # ── Node ──────────────────────────────────────────────────────────────
@@ -239,7 +300,7 @@ class GimbalControllerNode(Node):
         if sock is None:
             return
         try:
-            sock.sendall(build_euler_angle_packet(pitch, yaw))
+            sock.sendall(build_angle_control_packet(pitch, yaw))
         except OSError as exc:
             self.get_logger().warning(f"Gimbal send failed: {exc}")
             try:
@@ -312,22 +373,18 @@ class GimbalControllerNode(Node):
             return None
 
     def _handle_inbound(self, parsed: dict):
-        order   = parsed["order"]
-        payload = parsed["payload"]
-
-        # Heuristic state extraction: first three int16s as pitch/yaw/roll
-        # in centi-degrees. Update once the real packet layout is verified
-        # against AP_Mount_XFRobot.cpp.
-        if len(payload) >= 6:
-            try:
-                pitch, yaw, roll = struct.unpack_from("<hhh", payload, 0)
-                with self._lock:
-                    self._state_pitch = pitch / 100.0
-                    self._state_yaw   = yaw   / 100.0
-                    self._state_roll  = roll  / 100.0
-                self._publish_state()
-            except struct.error:
-                pass
+        # parse_state_packet now returns the camera attitude directly
+        # (extracted from bytes 18-23 of the reply: roll/pitch/yaw_abs_cd).
+        # yaw is unsigned 0..360 from the gimbal — convert to signed -180..+180
+        # so /gimbal/state matches the convention everywhere else.
+        yaw_signed = parsed["yaw_deg"]
+        if yaw_signed > 180.0:
+            yaw_signed -= 360.0
+        with self._lock:
+            self._state_roll  = parsed["roll_deg"]
+            self._state_pitch = parsed["pitch_deg"]
+            self._state_yaw   = yaw_signed
+        self._publish_state()
 
 
 def main(args=None):
