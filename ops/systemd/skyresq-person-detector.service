@@ -1,0 +1,20 @@
+[Unit]
+Description=SkyResQ - Person detector (YOLO26-Nano ncnn)
+PartOf=skyresq-core.target
+After=network-online.target skyresq-rtsp-camera.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision person_detector --ros-args -p image_topic:=/drone/camera_raw -p backend:=${DETECTOR_BACKEND} -p model_path:=${DETECTOR_MODEL_PATH} -p confidence_threshold:=${DETECTOR_CONFIDENCE} -p process_every_n:=${DETECTOR_PROCESS_EVERY_N} -p imgsz:=${DETECTOR_IMGSZ} -p publish_debug:=false -p timing_log_period_s:=5.0 -p best_by:=area'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-detector
+
+[Install]
+WantedBy=skyresq-core.target

@@ -1,0 +1,21 @@
+[Unit]
+Description=SkyResQ - MAVLink bridge (Pi <-> Cube Black FC)
+PartOf=skyresq-core.target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision mavlink_bridge --ros-args -p connection_string:=/dev/serial0 -p baud_rate:=57600 -p gcs_forward_ip:=${GCS_IP} -p gcs_forward_port:=${MAVLINK_FORWARD_PORT}'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-mavlink
+
+[Install]
+WantedBy=skyresq-core.target

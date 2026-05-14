@@ -1,0 +1,21 @@
+[Unit]
+Description=SkyResQ - RTSP camera intake (mediamtx -> /drone/camera_raw)
+PartOf=skyresq-core.target
+After=network-online.target mediamtx.service
+Wants=network-online.target mediamtx.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision rtsp_camera --ros-args -p rtsp_url:=rtsp://127.0.0.1:8554/skyresq_cam -p publish_compressed:=false'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-camera
+
+[Install]
+WantedBy=skyresq-core.target

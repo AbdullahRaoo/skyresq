@@ -1,0 +1,24 @@
+[Unit]
+Description=SkyResQ - Gimbal controller (XF Z-1 Mini TCP control)
+PartOf=skyresq-core.target
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision gimbal_controller --ros-args -p backend:=tcp -p gimbal_host:=${GIMBAL_HOST} -p gimbal_port:=${GIMBAL_CONTROL_PORT} -p command_rate_hz:=50.0 -p initial_pitch_deg:=-10.0 -p initial_yaw_deg:=0.0 -p pixel_gain_yaw:=${GIMBAL_PIXEL_GAIN_YAW} -p pixel_gain_pitch:=${GIMBAL_PIXEL_GAIN_PITCH} -p max_slew_dps:=${GIMBAL_MAX_SLEW_DPS}'
+Restart=on-failure
+# Z-1 Mini single-client TCP server holds the slot in TIME_WAIT for
+# 30–90 s after a disconnect. Restarting any sooner just spam-loops on
+# "Connection refused". 45 s is the empirically-safe middle.
+RestartSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-gimbal
+
+[Install]
+WantedBy=skyresq-core.target

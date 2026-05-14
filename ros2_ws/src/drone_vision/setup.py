@@ -36,6 +36,8 @@ setup(
             'geo_localiser      = drone_vision.geo.geo_localiser:main',
             'mavlink_bridge     = drone_vision.bridge.mavlink_bridge:main',
             'gcs_link           = drone_vision.bridge.gcs_link:main',
+            'payload_servo      = drone_vision.payload.payload_servo:main',
+            'sar_orchestrator   = drone_vision.mission.sar_orchestrator:main',
         ],
     },
 )

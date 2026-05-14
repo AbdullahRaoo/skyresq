@@ -45,7 +45,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPo
 
 from geometry_msgs.msg import PointStamped, Vector3Stamped
 from sensor_msgs.msg import NavSatFix
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 try:
     from pymavlink import mavutil
@@ -105,6 +105,57 @@ class MavlinkBridgeNode(Node):
         self._pub_home = self.create_publisher(NavSatFix,      "/vehicle/home",     home_qos)
         self._pub_gps  = self.create_publisher(NavSatFix,      "/vehicle/gps",      10)
         self._pub_arm  = self.create_publisher(Bool,           "/vehicle/armed",    10)
+        self._pub_mode = self.create_publisher(String,         "/vehicle/mode",     10)
+        self._last_mode_published: str | None = None
+
+        # ── Payload bridge ────────────────────────────────────────────
+        # Dashboard sends MAV_CMD_USER_1 over SiK (primary) or 4G/Tailscale
+        # mirror (secondary). ArduPilot routes the message to TELEM2 because
+        # the target_component != FC's compid. We translate to a /payload/cmd
+        # string ("open"|"close"|"toggle") which payload_servo consumes.
+        #
+        # Convention: param1 selects the action.
+        #   1.0 -> "open"   (release / 180°)
+        #   0.0 -> "close"  (grab / 0°)
+        #   2.0 -> "toggle"
+        self._pub_payload_cmd = self.create_publisher(String, "/payload/cmd", 10)
+        payload_state_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._payload_state: bool | None = None
+        self.create_subscription(
+            Bool, "/payload/state", self._on_payload_state, payload_state_qos
+        )
+
+        # ── Mission orchestrator → FC command bridge ─────────────────
+        # sar_orchestrator publishes intent on /mission/fly_to + /mission/cmd_rtl
+        # + /mission/set_mode; this node translates each into the matching
+        # MAVLink message and writes it to the FC serial.
+        from sensor_msgs.msg import NavSatFix as _NavSatFix
+        from std_msgs.msg import Empty as _Empty
+        self.create_subscription(_NavSatFix, "/mission/fly_to", self._on_mission_fly_to, 10)
+        self.create_subscription(_Empty, "/mission/cmd_rtl", self._on_mission_rtl, 10)
+        self.create_subscription(String, "/mission/set_mode", self._on_mission_set_mode, 10)
+
+        # /mission/enable published when the dashboard sends MAV_CMD_USER_2.
+        # Latched so a late-spawning sar_orchestrator gets the last value.
+        mission_enable_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+        self._pub_mission_enable = self.create_publisher(
+            Bool, "/mission/enable", mission_enable_qos
+        )
+        # Rate-limit fly_to writes — the orchestrator publishes every tick
+        # (~5 Hz) and the FC only needs the current setpoint; we throttle so
+        # we don't saturate the 57600-baud serial.
+        self._last_flyto_t = 0.0
+        self._flyto_min_interval = 0.5  # 2 Hz max
 
         # ── Home state ─────────────────────────────────────────────────
         self._home_lat:   float | None = None
@@ -118,12 +169,18 @@ class MavlinkBridgeNode(Node):
             f"Connecting to ArduPilot — {port}"
             + (f" @ {baud} baud" if is_serial else " (TCP/UDP)")
         )
+        # Identify as a separate "system 2" companion-computer
+        # (MAV_COMP_ID_ONBOARD_COMPUTER=191). Using a distinct sysid (not 1,
+        # which would collide with the FC) lets ArduPilot's MAVLink router
+        # cleanly forward GCS→(2,191) packets to TELEM2 — when we used
+        # sysid=1 same as the FC, the routing collapsed the two entries and
+        # the forward never happened.
         self._mav = mavutil.mavlink_connection(
             port,
             baud=baud,
             autoreconnect=True,
-            source_system=255,
-            source_component=0,
+            source_system=2,
+            source_component=mavutil.mavlink.MAV_COMP_ID_ONBOARD_COMPUTER,
         )
 
         hb = self._mav.wait_heartbeat(timeout=30)
@@ -157,6 +214,12 @@ class MavlinkBridgeNode(Node):
 
         self._hb_interval = 1.0 / max(hb_hz, 0.5)
         self._last_hb_t   = 0.0
+
+        # Diagnostic: aggregate msg_type counts, log every 5 s.
+        # Lets us answer "does FC forward COMMAND_LONG (and other GCS→Pi
+        # routed messages) over TELEM2 at all?" without grepping every frame.
+        self._msg_type_counts: dict[str, int] = {}
+        self._last_stats_t = 0.0
 
         # ── GCS UDP forward (optional) ─────────────────────────────────
         self._fwd_sock: socket.socket | None = None
@@ -196,10 +259,12 @@ class MavlinkBridgeNode(Node):
         while not self._stop.is_set():
             now = time.monotonic()
             if now - self._last_hb_t >= self._hb_interval:
+                # Companion-computer heartbeat. Lets ArduPilot learn that
+                # compid 191 lives on TELEM2 and route inbound packets here.
                 self._mav.mav.heartbeat_send(
-                    mavutil.mavlink.MAV_TYPE_GCS,
+                    mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
                     mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                    0, 0, 0,
+                    0, 0, mavutil.mavlink.MAV_STATE_ACTIVE,
                 )
                 self._last_hb_t = now
 
@@ -210,6 +275,25 @@ class MavlinkBridgeNode(Node):
             msg_type = msg.get_type()
             if msg_type == "BAD_DATA":
                 continue
+
+            # Loud log on routing-relevant inbound events so we can tell
+            # at a glance whether FC forwards GCS→Pi commands over SiK.
+            if msg_type in ("COMMAND_LONG", "COMMAND_INT", "COMMAND_ACK",
+                            "HEARTBEAT", "STATUSTEXT"):
+                src_sys = msg.get_srcSystem()
+                src_comp = msg.get_srcComponent()
+                # Skip our own emitted heartbeats (sysid=2 compid=191)
+                if not (msg_type == "HEARTBEAT" and src_sys == 2 and src_comp == 191):
+                    extras = ""
+                    if msg_type == "COMMAND_LONG":
+                        extras = (f" cmd={int(msg.command)} "
+                                  f"tgt_sys={msg.target_system} tgt_comp={msg.target_component} "
+                                  f"p1={msg.param1}")
+                    elif msg_type == "COMMAND_ACK":
+                        extras = f" cmd={int(msg.command)} result={int(msg.result)}"
+                    self.get_logger().info(
+                        f"rx {msg_type} from src=({src_sys},{src_comp}){extras}"
+                    )
 
             # Mirror the raw frame to the GCS over UDP (Tailscale)
             if self._fwd_sock is not None:
@@ -229,6 +313,8 @@ class MavlinkBridgeNode(Node):
             elif msg_type == "HEARTBEAT":
                 if msg.get_srcSystem() == self._sysid:
                     self._handle_heartbeat(msg)
+            elif msg_type == "COMMAND_LONG":
+                self._handle_command_long(msg)
 
     # ── GCS → FC forwarder (background thread) ────────────────────────
     #
@@ -238,6 +324,11 @@ class MavlinkBridgeNode(Node):
     # the 4G link.
 
     def _gcs_to_fc_loop(self):
+        # Separate MAVLink parser instance for UDP-injected bytes so partial
+        # frames from the UDP socket don't corrupt the serial parser buffer.
+        udp_parser = mavutil.mavlink.MAVLink(None)
+        udp_parser.robust_parsing = True
+
         while not self._stop.is_set():
             try:
                 data, addr = self._fwd_sock.recvfrom(2048)
@@ -249,6 +340,32 @@ class MavlinkBridgeNode(Node):
                 continue
 
             if not data:
+                continue
+
+            # Parse first so we can intercept payload commands locally without
+            # round-tripping through the FC (ArduPilot's MAVLink router does
+            # not reliably forward COMMAND_LONG with target_component=191).
+            intercepted = False
+            try:
+                msgs = udp_parser.parse_buffer(data)
+            except Exception:
+                msgs = None
+            if msgs:
+                for m in msgs:
+                    if m.get_type() != "COMMAND_LONG":
+                        continue
+                    cmd = int(getattr(m, "command", -1))
+                    if cmd == mavutil.mavlink.MAV_CMD_USER_1:
+                        self.get_logger().info("payload MAV_CMD_USER_1 via UDP — handled locally")
+                        self._handle_command_long(m)
+                        intercepted = True
+                    elif cmd == mavutil.mavlink.MAV_CMD_USER_2:
+                        self.get_logger().info("mission MAV_CMD_USER_2 via UDP — handled locally")
+                        self._handle_command_long(m)
+                        intercepted = True
+
+            if intercepted:
+                # Don't relay the payload command to FC — it's a Pi-only command.
                 continue
 
             try:
@@ -334,11 +451,174 @@ class MavlinkBridgeNode(Node):
             self._pub_home.publish(home)
             self._home_pub_t = now
 
+    # ArduCopter mode IDs → names (subset used in the SAR mission).
+    _COPTER_MODE = {
+        0: "STABILIZE", 1: "ACRO", 2: "ALT_HOLD", 3: "AUTO", 4: "GUIDED",
+        5: "LOITER", 6: "RTL", 7: "CIRCLE", 9: "LAND", 16: "POSHOLD",
+        17: "BRAKE", 20: "GUIDED_NOGPS", 21: "SMART_RTL",
+    }
+
     def _handle_heartbeat(self, msg):
         armed = bool(msg.base_mode & 128)   # MAV_MODE_FLAG_SAFETY_ARMED
         b = Bool()
         b.data = armed
         self._pub_arm.publish(b)
+        # Publish flight mode (used by sar_orchestrator + dashboard).
+        mode_name = self._COPTER_MODE.get(int(msg.custom_mode), f"MODE_{int(msg.custom_mode)}")
+        if mode_name != self._last_mode_published:
+            self._last_mode_published = mode_name
+            sm = String()
+            sm.data = mode_name
+            self._pub_mode.publish(sm)
+
+    # ── Payload command routing ────────────────────────────────────────
+
+    def _handle_command_long(self, msg):
+        # MAV_CMD_USER_1 = 31010 — repurposed for payload toggle.
+        try:
+            cmd_id = int(msg.command)
+        except Exception:
+            return
+        # Log every inbound COMMAND_LONG so we can see what's being routed.
+        self.get_logger().info(
+            f"COMMAND_LONG seen: cmd={cmd_id} target_sys={msg.target_system} "
+            f"target_comp={msg.target_component} src_sys={msg.get_srcSystem()} "
+            f"src_comp={msg.get_srcComponent()} param1={msg.param1}"
+        )
+        # MAV_CMD_USER_2 = 31011 — repurposed for SAR autonomy enable/disable.
+        # param1 1.0 = enable, 0.0 = disable.
+        if cmd_id == mavutil.mavlink.MAV_CMD_USER_2:
+            enable = float(getattr(msg, "param1", 0.0)) > 0.5
+            self.get_logger().info(f"mission enable from GCS: {enable}")
+            b = Bool()
+            b.data = enable
+            self._pub_mission_enable.publish(b)
+            self._send_ack(cmd_id, mavutil.mavlink.MAV_RESULT_ACCEPTED)
+            return
+        if cmd_id != mavutil.mavlink.MAV_CMD_USER_1:
+            return
+        # Translate param1 -> action
+        action_map = {1.0: "open", 0.0: "close", 2.0: "toggle"}
+        param1 = float(getattr(msg, "param1", 0.0))
+        # Tolerant match
+        action = None
+        for key, name in action_map.items():
+            if abs(param1 - key) < 0.25:
+                action = name
+                break
+        if action is None:
+            self.get_logger().warning(
+                f"payload MAV_CMD_USER_1 with unknown param1={param1}"
+            )
+            self._send_ack(cmd_id, mavutil.mavlink.MAV_RESULT_DENIED)
+            return
+        self.get_logger().info(
+            f"payload command from GCS: {action} (param1={param1})"
+        )
+        out = String()
+        out.data = action
+        self._pub_payload_cmd.publish(out)
+        self._send_ack(cmd_id, mavutil.mavlink.MAV_RESULT_ACCEPTED)
+
+    def _send_ack(self, cmd_id, result):
+        try:
+            self._mav.mav.command_ack_send(cmd_id, result)
+        except Exception as exc:
+            self.get_logger().debug(f"COMMAND_ACK send failed: {exc}")
+
+    # ── Orchestrator → FC ─────────────────────────────────────────────
+
+    # Mode names → ArduCopter custom_mode ids (mirror of _COPTER_MODE)
+    _MODE_ID_FROM_NAME = {
+        "STABILIZE": 0, "ACRO": 1, "ALT_HOLD": 2, "AUTO": 3, "GUIDED": 4,
+        "LOITER": 5, "RTL": 6, "CIRCLE": 7, "LAND": 9, "POSHOLD": 16,
+        "BRAKE": 17, "GUIDED_NOGPS": 20, "SMART_RTL": 21,
+    }
+
+    def _on_mission_fly_to(self, msg):
+        # Rate limit — see comment in constructor.
+        now = time.monotonic()
+        if now - self._last_flyto_t < self._flyto_min_interval:
+            return
+        self._last_flyto_t = now
+        lat = float(msg.latitude)
+        lon = float(msg.longitude)
+        alt = float(msg.altitude)
+        if not (lat or lon):
+            return
+        # ArduPilot SET_POSITION_TARGET_GLOBAL_INT type_mask. We want to use
+        # ONLY position; tell FC to ignore vel (bits 3-5), accel (6-8), yaw
+        # (bit 10), yaw_rate (bit 11). DO NOT set bit 9 (FORCE_SET) — that
+        # would tell FC "treat accel fields as force commands" which is the
+        # wrong interpretation and was a silent bug previously.
+        # bits set: 3,4,5,6,7,8,10,11 = 8+16+32+64+128+256+1024+2048 = 0xDF8
+        # ref: https://mavlink.io/en/messages/common.html#POSITION_TARGET_TYPEMASK
+        ignore_vel_accel_yaw = 0xDF8
+        type_mask = ignore_vel_accel_yaw
+        if math.isnan(alt):
+            type_mask |= 0b100         # also ignore alt (bit 2) — hold current
+            alt = 0.0
+        try:
+            self._mav.mav.set_position_target_global_int_send(
+                0,                                  # time_boot_ms
+                self._mav.target_system,
+                self._mav.target_component,
+                mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+                type_mask,
+                int(lat * 1e7),
+                int(lon * 1e7),
+                float(alt),
+                0.0, 0.0, 0.0,    # vel x/y/z (ignored)
+                0.0, 0.0, 0.0,    # acc x/y/z (ignored)
+                0.0, 0.0,         # yaw, yaw_rate (ignored)
+            )
+        except Exception as exc:
+            self.get_logger().warning(f"fly_to send failed: {exc}")
+
+    def _on_mission_rtl(self, _msg):
+        try:
+            self._mav.mav.command_long_send(
+                self._mav.target_system,
+                self._mav.target_component,
+                mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH,
+                0,
+                0, 0, 0, 0, 0, 0, 0,
+            )
+            self.get_logger().info("RTL command sent")
+        except Exception as exc:
+            self.get_logger().warning(f"RTL send failed: {exc}")
+
+    def _on_mission_set_mode(self, msg):
+        name = (msg.data or "").strip().upper()
+        mode_id = self._MODE_ID_FROM_NAME.get(name)
+        if mode_id is None:
+            self.get_logger().warning(f"unknown flight mode requested: {name!r}")
+            return
+        try:
+            self._mav.mav.set_mode_send(
+                self._mav.target_system,
+                mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                mode_id,
+            )
+            self.get_logger().info(f"set_mode → {name} (id={mode_id})")
+        except Exception as exc:
+            self.get_logger().warning(f"set_mode failed: {exc}")
+
+    def _on_payload_state(self, msg: Bool):
+        # Emit NAMED_VALUE_INT("PLDOPEN", 0|1) upstream so dashboard can
+        # render the current state regardless of which link is up.
+        is_open = 1 if msg.data else 0
+        if self._payload_state == is_open:
+            return
+        self._payload_state = is_open
+        try:
+            self._mav.mav.named_value_int_send(
+                int(time.monotonic() * 1000) & 0xFFFFFFFF,
+                b"PLDOPEN",
+                is_open,
+            )
+        except Exception as exc:
+            self.get_logger().debug(f"NAMED_VALUE_INT PLDOPEN failed: {exc}")
 
 
 def main(args=None):

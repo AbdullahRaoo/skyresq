@@ -1,0 +1,24 @@
+# SkyResQ pipeline runtime config. Loaded by every systemd unit via
+# EnvironmentFile=. Edit + restart services to apply.
+#
+# Operator GCS (dev PC / dashboard). Used by mavlink_bridge (MAVLink mirror)
+# and gcs_link (SAR JSON UDP). Both reach the dashboard.
+GCS_IP=100.93.242.103
+GCS_PORT=5005
+MAVLINK_FORWARD_PORT=14550
+
+# Gimbal XF Z-1 Mini (TCP control on :2332, RTSP on :554)
+GIMBAL_HOST=192.168.144.108
+GIMBAL_CONTROL_PORT=2332
+
+# Pipeline tuning
+DETECTOR_MODEL_PATH=/home/pi/Drone/yolo26n_ncnn_model
+DETECTOR_BACKEND=ncnn
+DETECTOR_IMGSZ=320
+DETECTOR_PROCESS_EVERY_N=2
+DETECTOR_CONFIDENCE=0.30
+GIMBAL_PIXEL_GAIN_YAW=30.0
+GIMBAL_PIXEL_GAIN_PITCH=20.0
+GIMBAL_MAX_SLEW_DPS=80.0
+STREAM_WIDTH=1920
+STREAM_HEIGHT=1080

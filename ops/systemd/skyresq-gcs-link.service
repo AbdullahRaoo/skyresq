@@ -1,0 +1,20 @@
+[Unit]
+Description=SkyResQ - GCS link (survivor_cluster / detection_frame / pi_status UDP)
+PartOf=skyresq-core.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision gcs_link --ros-args -p gcs_ip:=${GCS_IP} -p gcs_port:=${GCS_PORT} -p confidence_min:=${DETECTOR_CONFIDENCE} -p stream_width:=${STREAM_WIDTH} -p stream_height:=${STREAM_HEIGHT}'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-gcs-link
+
+[Install]
+WantedBy=skyresq-core.target

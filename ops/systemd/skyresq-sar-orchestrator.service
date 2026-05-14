@@ -1,0 +1,20 @@
+[Unit]
+Description=SkyResQ - SAR mission orchestrator (autonomy state machine, opt-in)
+# Deliberately NOT PartOf=skyresq-core.target — keep autonomy off by default.
+# Enable with: sudo systemctl enable --now skyresq-sar-orchestrator
+# The /mission/enable kill-switch from the dashboard gates real FC actions
+# even when this is running.
+After=network-online.target skyresq-mavlink-bridge.service skyresq-geo-localiser.service skyresq-payload-servo.service
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/Drone/ros2_ws
+EnvironmentFile=-/home/pi/Drone/ops/config
+ExecStart=/bin/bash -c 'source /home/pi/Drone/ops/env.sh && exec ros2 run drone_vision sar_orchestrator'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=skyresq-sar

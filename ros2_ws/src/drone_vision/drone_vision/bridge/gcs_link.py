@@ -250,6 +250,18 @@ class GcsLinkNode(Node):
         self.create_subscription(Vector3Stamped, "/gimbal/state", self._on_gimbal, 10)
         self.create_subscription(Bool, "/vehicle/armed", self._on_armed, 10)
 
+        # sar_orchestrator publishes /mission/state — relay to dashboard so
+        # the operator can see what phase autonomy is in. Late-import avoids
+        # a hard dep when drone_msgs isn't installed in dev environments.
+        try:
+            from drone_msgs.msg import MissionState as _MissionState
+            self.create_subscription(_MissionState, "/mission/state",
+                                     self._on_mission_state, 10)
+            self._last_mission_state: dict | None = None
+            self.create_timer(0.5, self._send_mission_state_if_any)
+        except Exception:
+            self._last_mission_state = None
+
         # 1 Hz Pi-status heartbeat (operator sees companion health)
         self.create_timer(status_period, self._send_pi_status)
 
@@ -345,6 +357,31 @@ class GcsLinkNode(Node):
     def _on_armed(self, msg: Bool):
         self._fc_rate.tick()
         self._fc_armed = bool(msg.data)
+
+    def _on_mission_state(self, msg):
+        import math as _m
+        def _num_or_none(v):
+            try:
+                f = float(v)
+                return None if _m.isnan(f) else round(f, 2)
+            except Exception:
+                return None
+        self._last_mission_state = {
+            "type":              "mission_state",
+            "state":             str(msg.state),
+            "sub_state":         str(msg.sub_state),
+            "target_distance_m": _num_or_none(msg.target_distance_m),
+            "altitude_agl_m":    _num_or_none(msg.altitude_agl_m),
+            "battery_remaining": _num_or_none(msg.battery_remaining),
+            "vision_locked":     bool(msg.vision_locked),
+            "gimbal_healthy":    bool(msg.gimbal_healthy),
+            "gps_healthy":       bool(msg.gps_healthy),
+            "ts_ms":             int(time.time() * 1000),
+        }
+
+    def _send_mission_state_if_any(self):
+        if self._last_mission_state is not None:
+            self._send_json(self._last_mission_state)
 
     # ── pi_status (1 Hz) ──────────────────────────────────────────────
 

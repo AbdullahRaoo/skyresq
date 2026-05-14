@@ -58,9 +58,12 @@ XFRobot framing (verified against ArduPilot AP_Mount_XFRobot.cpp)
     bytes 22-23 yaw_abs_cd   uint16 LE centi-deg (0..36000)
 """
 
+import fcntl
 import math
+import os
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -204,13 +207,43 @@ class GimbalControllerNode(Node):
     def __init__(self):
         super().__init__("gimbal_controller")
 
+        # Single-instance guard. The XF Z-1 Mini's :2332 control server
+        # accepts one client and locks out new connections for ~30–90 s
+        # after a disconnect. Two gimbal_controllers racing for the same
+        # socket means one of them is permanently stuck on "Connection
+        # refused" until you power-cycle the gimbal. An OS-level flock on
+        # /tmp prevents the second instance from coming up at all.
+        self._lock_path = "/tmp/gimbal_controller.lock"
+        try:
+            self._lock_fd = open(self._lock_path, "w")
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._lock_fd.write(str(os.getpid()))
+            self._lock_fd.flush()
+        except (OSError, BlockingIOError):
+            self.get_logger().error(
+                f"another gimbal_controller already holds {self._lock_path} — "
+                "refusing to start a second instance (would deadlock on "
+                "the gimbal's single-client TCP). Kill it first."
+            )
+            # Don't go through rclpy shutdown — main() handles that.
+            sys.exit(2)
+
         self.declare_parameter("gimbal_host",       "192.168.144.108")
         self.declare_parameter("gimbal_port",       2332)
         self.declare_parameter("command_rate_hz",   50.0)
         self.declare_parameter("state_rate_hz",     20.0)
         self.declare_parameter("backend",           "tcp")
+        # Each detection nudges a `desired` setpoint by ex * pixel_gain.
+        # The controller then slews the actual gimbal target toward
+        # `desired` at max_slew_dps deg/sec — smooth, no jerk, rate
+        # independent of detection fps.
         self.declare_parameter("pixel_gain_yaw",    30.0)
         self.declare_parameter("pixel_gain_pitch",  20.0)
+        # Max smoothing slew rate (deg/sec). Below the gimbal's physical
+        # max so motion looks intentional rather than reactive.
+        self.declare_parameter("max_slew_dps",      80.0)
+        # Ignore tiny pixel errors to avoid jitter on detector noise.
+        self.declare_parameter("pixel_deadband",     0.05)
         self.declare_parameter("yaw_min_deg",       -180.0)
         self.declare_parameter("yaw_max_deg",        180.0)
         self.declare_parameter("pitch_min_deg",     -90.0)
@@ -228,6 +261,10 @@ class GimbalControllerNode(Node):
         self._backend    = self.get_parameter("backend").value
         self._k_yaw      = float(self.get_parameter("pixel_gain_yaw").value)
         self._k_pitch    = float(self.get_parameter("pixel_gain_pitch").value)
+        self._pixel_deadband = float(self.get_parameter("pixel_deadband").value)
+        self._max_slew_dps = float(self.get_parameter("max_slew_dps").value)
+        self._cmd_dt = 1.0 / max(cmd_hz, 1.0)
+        self._max_step_per_tick = self._max_slew_dps * self._cmd_dt
         self._yaw_min    = float(self.get_parameter("yaw_min_deg").value)
         self._yaw_max    = float(self.get_parameter("yaw_max_deg").value)
         self._pitch_min  = float(self.get_parameter("pitch_min_deg").value)
@@ -240,6 +277,9 @@ class GimbalControllerNode(Node):
         init_yaw   = float(self.get_parameter("initial_yaw_deg").value)
         self._target_pitch = max(self._pitch_min, min(self._pitch_max, init_pitch))
         self._target_yaw   = max(self._yaw_min,   min(self._yaw_max,   init_yaw))
+        # Smoothing setpoint — _target_* converges toward these at max_slew.
+        self._desired_pitch = self._target_pitch
+        self._desired_yaw   = self._target_yaw
         # Seed state with the same values so /gimbal/state reads sensibly
         # before the gimbal sends its first reply
         self._state_pitch  = self._target_pitch
@@ -274,9 +314,25 @@ class GimbalControllerNode(Node):
 
     def destroy_node(self):
         self._stop.set()
-        if self._sock is not None:
+        sock = self._sock
+        self._sock = None
+        # Release the single-instance lock so the next launch can start.
+        try:
+            if hasattr(self, "_lock_fd") and self._lock_fd is not None:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                self._lock_fd.close()
+        except Exception:
+            pass
+        if sock is not None:
             try:
-                self._sock.close()
+                # Half-close write side first so the gimbal sees FIN
+                # immediately instead of waiting for a TCP keepalive
+                # timeout (~30–90 s) before freeing its 1-client slot.
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
             except Exception:
                 pass
         super().destroy_node()
@@ -284,19 +340,32 @@ class GimbalControllerNode(Node):
     # ── ROS callbacks ─────────────────────────────────────────────────
 
     def _on_pixel_cmd(self, msg: PointStamped):
-        """Update target Euler angles from normalised pixel error."""
+        """Nudge the *desired* setpoint by ex/ey * gain. The command tick
+        slews the actual target toward desired at max_slew_dps so the
+        gimbal moves smoothly even on large per-event steps."""
         ex = float(msg.point.x)   # -1..1, +ve = target right of centre
         ey = float(msg.point.y)   # -1..1, +ve = target below centre
-
+        if abs(ex) < self._pixel_deadband:
+            ex = 0.0
+        if abs(ey) < self._pixel_deadband:
+            ey = 0.0
+        if ex == 0.0 and ey == 0.0:
+            return
         with self._lock:
-            yaw   = self._target_yaw   + ex * self._k_yaw
-            pitch = self._target_pitch - ey * self._k_pitch
-            self._target_yaw   = max(self._yaw_min,   min(self._yaw_max,   yaw))
-            self._target_pitch = max(self._pitch_min, min(self._pitch_max, pitch))
+            yaw   = self._desired_yaw   + ex * self._k_yaw
+            pitch = self._desired_pitch - ey * self._k_pitch
+            self._desired_yaw   = max(self._yaw_min,   min(self._yaw_max,   yaw))
+            self._desired_pitch = max(self._pitch_min, min(self._pitch_max, pitch))
 
     def _send_command_tick(self):
-        """Emit one EULER_ANGLE_CONTROL packet (tcp) or echo state (sim)."""
+        """Slew target toward desired at max_slew_dps, then emit one
+        EULER_ANGLE_CONTROL packet (tcp) or echo state (sim)."""
         with self._lock:
+            step = self._max_step_per_tick
+            dy = self._desired_yaw - self._target_yaw
+            dp = self._desired_pitch - self._target_pitch
+            self._target_yaw += max(-step, min(step, dy))
+            self._target_pitch += max(-step, min(step, dp))
             pitch = self._target_pitch
             yaw   = self._target_yaw
 

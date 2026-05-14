@@ -1,0 +1,16 @@
+[Unit]
+Description=SkyResQ SAR pipeline (core nodes)
+Documentation=https://github.com/AbdullahRaoo/Drone
+After=network-online.target
+Wants=network-online.target
+Wants=skyresq-mavlink-bridge.service
+Wants=skyresq-rtsp-camera.service
+Wants=skyresq-gimbal-controller.service
+Wants=skyresq-visual-servo.service
+Wants=skyresq-payload-servo.service
+Wants=skyresq-person-detector.service
+Wants=skyresq-geo-localiser.service
+Wants=skyresq-gcs-link.service
+
+[Install]
+WantedBy=multi-user.target
