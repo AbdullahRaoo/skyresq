@@ -128,6 +128,15 @@ class SarOrchestrator(Node):
         self.declare_parameter("min_confidence",    0.45)
         self.declare_parameter("home_tol_m",        4.0)
         self.declare_parameter("tick_hz",           5.0)
+        # Grace period before we abort an APPROACH/DROP because the FC
+        # briefly reported a non-GUIDED mode. Without this the orchestrator
+        # is too twitchy — any single-tick mode read from a hiccupping link
+        # kills the mission.
+        self.declare_parameter("mode_abort_grace_s", 2.0)
+        # Hard timeout for RTL — if we don't see home within this long,
+        # declare DONE so the state machine doesn't hang forever (e.g. on
+        # the bench with no GPS).
+        self.declare_parameter("rtl_max_s",         180.0)
 
         self._hold_time_s     = float(self.get_parameter("hold_time_s").value)
         self._approach_tol_m  = float(self.get_parameter("approach_tol_m").value)
@@ -135,7 +144,12 @@ class SarOrchestrator(Node):
         self._drop_hold_s     = float(self.get_parameter("drop_hold_s").value)
         self._min_confidence  = float(self.get_parameter("min_confidence").value)
         self._home_tol_m      = float(self.get_parameter("home_tol_m").value)
+        self._mode_abort_grace_s = float(self.get_parameter("mode_abort_grace_s").value)
+        self._rtl_max_s       = float(self.get_parameter("rtl_max_s").value)
         tick_hz               = float(self.get_parameter("tick_hz").value)
+
+        # Track when we first saw a wrong mode so we can apply grace period
+        self._wrong_mode_since: float = 0.0
 
         # ── State ─────────────────────────────────────────────
         self._state = STATE_IDLE
@@ -227,15 +241,30 @@ class SarOrchestrator(Node):
 
         # Continuously check mode for setpoint-issuing states. ArduPilot
         # auto-reverts mode when the TX switch moves, so we use that as
-        # our pilot-takeover detector.
+        # our pilot-takeover detector. Grace period prevents single-tick
+        # mode hiccups (link blip, race between heartbeats) from killing
+        # the mission.
+        now_m = time.monotonic()
         if self._state in (STATE_APPROACH, STATE_DROP, STATE_DROP_HOLD):
             if self._mode != "GUIDED":
-                self._enter(STATE_IDLE, reason=f"pilot took over (mode={self._mode})")
-                return
+                if self._wrong_mode_since == 0.0:
+                    self._wrong_mode_since = now_m
+                elif (now_m - self._wrong_mode_since) >= self._mode_abort_grace_s:
+                    self._enter(STATE_IDLE,
+                                reason=f"pilot took over (mode={self._mode} for {now_m - self._wrong_mode_since:.1f}s)")
+                    self._wrong_mode_since = 0.0
+                    return
+            else:
+                self._wrong_mode_since = 0.0
         if self._state == STATE_RTL and self._mode != "RTL":
-            # Pilot can cancel RTL; not necessarily a fault, just abort.
-            self._enter(STATE_IDLE, reason="RTL cancelled by pilot")
-            return
+            if self._wrong_mode_since == 0.0:
+                self._wrong_mode_since = now_m
+            elif (now_m - self._wrong_mode_since) >= self._mode_abort_grace_s:
+                self._enter(STATE_IDLE, reason="RTL cancelled by pilot")
+                self._wrong_mode_since = 0.0
+                return
+        else:
+            self._wrong_mode_since = 0.0
 
         handler = {
             STATE_IDLE:           self._tick_idle,
@@ -347,6 +376,14 @@ class SarOrchestrator(Node):
             self._enter(STATE_RTL, reason="drop complete")
 
     def _tick_rtl(self):
+        # Hard timeout so we don't hang in RTL forever if home is never set
+        # or the drone can't reach home (bench test, GPS dropout, low batt
+        # forcing a land elsewhere).
+        elapsed = time.monotonic() - self._state_entered_t
+        if elapsed >= self._rtl_max_s:
+            self._enter(STATE_DONE,
+                        reason=f"RTL timeout ({elapsed:.0f}s, no home arrival)")
+            return
         if self._home_lat is None or self._drone_lat is None:
             return
         d = haversine_m(
