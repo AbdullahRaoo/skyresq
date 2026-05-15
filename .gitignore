@@ -26,3 +26,4 @@ __pycache__/
 # Model export artifacts
 yolo*_ncnn_model/
 calib_frames/
+.bench/
