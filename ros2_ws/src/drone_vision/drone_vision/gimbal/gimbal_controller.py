@@ -292,6 +292,15 @@ class GimbalControllerNode(Node):
         self.create_subscription(
             PointStamped, "/gimbal/cmd/look_at_pixel", self._on_pixel_cmd, 50
         )
+        # Manual operator setpoint from the dashboard (via mavlink_bridge
+        # MAV_CMD_USER_3). Vector3: y=pitch deg, z=yaw deg. Additive —
+        # feeds the same _desired_* setpoints the autonomous pixel path
+        # uses, so the existing slew/emit pipeline is unchanged. Last
+        # command wins; in the SAR flow manual and autonomous never run
+        # at the same time.
+        self.create_subscription(
+            Vector3Stamped, "/gimbal/cmd/set_attitude", self._on_set_attitude, 10
+        )
 
         # Outbound command timer (rate-limits writes regardless of inbound rate)
         self.create_timer(1.0 / max(cmd_hz, 1.0), self._send_command_tick)
@@ -356,6 +365,15 @@ class GimbalControllerNode(Node):
             pitch = self._desired_pitch - ey * self._k_pitch
             self._desired_yaw   = max(self._yaw_min,   min(self._yaw_max,   yaw))
             self._desired_pitch = max(self._pitch_min, min(self._pitch_max, pitch))
+
+    def _on_set_attitude(self, msg: Vector3Stamped):
+        """Absolute manual setpoint (deg) from the dashboard operator.
+        Clamped to the same limits as the autonomous path."""
+        pitch = float(msg.vector.y)
+        yaw = float(msg.vector.z)
+        with self._lock:
+            self._desired_pitch = max(self._pitch_min, min(self._pitch_max, pitch))
+            self._desired_yaw = max(self._yaw_min, min(self._yaw_max, yaw))
 
     def _send_command_tick(self):
         """Slew target toward desired at max_slew_dps, then emit one

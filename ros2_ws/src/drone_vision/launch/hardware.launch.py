@@ -158,6 +158,14 @@ def generate_launch_description():
         executable="geo_localiser",
         name="geo_localiser",
         parameters=[{
+            # Use the REAL camera intrinsics, not the sim default. NOTE:
+            # camera_intrinsics_z1mini.yaml is still a placeholder — it
+            # MUST be replaced with a checkerboard calibration before
+            # geolocation is trustworthy in flight.
+            "intrinsics_file": os.path.expanduser(
+                "~/Drone/ros2_ws/src/drone_vision/"
+                "config/camera_intrinsics_z1mini.yaml"
+            ),
             "image_width":    320,
             "image_height":   240,
             "confidence_min": 0.45,

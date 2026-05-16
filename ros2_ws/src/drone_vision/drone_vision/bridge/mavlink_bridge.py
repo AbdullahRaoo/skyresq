@@ -151,6 +151,13 @@ class MavlinkBridgeNode(Node):
         self._pub_mission_enable = self.create_publisher(
             Bool, "/mission/enable", mission_enable_qos
         )
+        # /gimbal/cmd/set_attitude published when the dashboard sends
+        # MAV_CMD_USER_3 (param1=pitch deg, param2=yaw deg) for manual
+        # operator gimbal control. Purely additive — the autonomous
+        # look_at_pixel tracking path is untouched.
+        self._pub_gimbal_setpoint = self.create_publisher(
+            Vector3Stamped, "/gimbal/cmd/set_attitude", 10
+        )
         # Rate-limit fly_to writes — the orchestrator publishes every tick
         # (~5 Hz) and the FC only needs the current setpoint; we throttle so
         # we don't saturate the 57600-baud serial.
@@ -363,6 +370,10 @@ class MavlinkBridgeNode(Node):
                         self.get_logger().info("mission MAV_CMD_USER_2 via UDP — handled locally")
                         self._handle_command_long(m)
                         intercepted = True
+                    elif cmd == mavutil.mavlink.MAV_CMD_USER_3:
+                        self.get_logger().info("gimbal MAV_CMD_USER_3 via UDP — handled locally")
+                        self._handle_command_long(m)
+                        intercepted = True
 
             if intercepted:
                 # Don't relay the payload command to FC — it's a Pi-only command.
@@ -493,6 +504,24 @@ class MavlinkBridgeNode(Node):
             b = Bool()
             b.data = enable
             self._pub_mission_enable.publish(b)
+            self._send_ack(cmd_id, mavutil.mavlink.MAV_RESULT_ACCEPTED)
+            return
+        # MAV_CMD_USER_3 = 31012 — repurposed for manual gimbal control.
+        # param1 = pitch deg, param2 = yaw deg. Additive: just publishes a
+        # setpoint the gimbal_controller already knows how to slew to; the
+        # autonomous look_at_pixel path is unaffected.
+        if cmd_id == mavutil.mavlink.MAV_CMD_USER_3:
+            pitch = float(getattr(msg, "param1", 0.0))
+            yaw = float(getattr(msg, "param2", 0.0))
+            self.get_logger().info(
+                f"gimbal setpoint from GCS: pitch={pitch:.1f} yaw={yaw:.1f}"
+            )
+            v = Vector3Stamped()
+            v.header.stamp = self.get_clock().now().to_msg()
+            v.vector.x = 0.0
+            v.vector.y = pitch
+            v.vector.z = yaw
+            self._pub_gimbal_setpoint.publish(v)
             self._send_ack(cmd_id, mavutil.mavlink.MAV_RESULT_ACCEPTED)
             return
         if cmd_id != mavutil.mavlink.MAV_CMD_USER_1:
