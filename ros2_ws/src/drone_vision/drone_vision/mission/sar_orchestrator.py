@@ -156,6 +156,8 @@ class SarOrchestrator(Node):
         self._enabled = False
         self._armed = False
         self._mode = "UNKNOWN"
+        self._gimbal_healthy = False
+        self._gimbal_health_t = 0.0
         self._drone_lat = None
         self._drone_lon = None
         self._home_lat = None
@@ -182,6 +184,7 @@ class SarOrchestrator(Node):
         self.create_subscription(String, "/vehicle/mode", self._on_mode, 10)
         self.create_subscription(Bool, "/mission/enable", self._on_enable, latched)
         self.create_subscription(Bool, "/payload/state", self._on_payload, latched)
+        self.create_subscription(Bool, "/gimbal/health", self._on_gimbal_health, 10)
 
         # ── Pubs ──────────────────────────────────────────────
         self._pub_state = self.create_publisher(MissionState, "/mission/state", 10)
@@ -219,6 +222,10 @@ class SarOrchestrator(Node):
 
     def _on_mode(self, msg: String):
         self._mode = (msg.data or "UNKNOWN").upper()
+
+    def _on_gimbal_health(self, msg: Bool):
+        self._gimbal_healthy = bool(msg.data)
+        self._gimbal_health_t = time.monotonic()
 
     def _on_enable(self, msg: Bool):
         was = self._enabled
@@ -422,7 +429,14 @@ class SarOrchestrator(Node):
         m.battery_remaining = float("nan")
         m.vision_locked = self._last_target is not None and \
             (time.monotonic() - self._last_target_t) < 1.5
-        m.gimbal_healthy = True
+        # Healthy only if gimbal_controller reported True within the last
+        # 5 s. Stale/absent (controller down, never started) → unhealthy,
+        # so the dashboard SAR card shows a truthful gimbal dot instead of
+        # the old hardcoded green.
+        m.gimbal_healthy = bool(
+            self._gimbal_healthy
+            and (time.monotonic() - self._gimbal_health_t) < 5.0
+        )
         m.gps_healthy = self._drone_lat is not None
         self._pub_state.publish(m)
 

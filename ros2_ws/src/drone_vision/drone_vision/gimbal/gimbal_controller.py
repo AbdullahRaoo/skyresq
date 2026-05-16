@@ -71,6 +71,7 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import PointStamped, Vector3Stamped
+from std_msgs.msg import Bool
 
 
 # ── Protocol constants ────────────────────────────────────────────────
@@ -289,6 +290,13 @@ class GimbalControllerNode(Node):
 
         # ── ROS interfaces ─────────────────────────────────────────────
         self._pub_state = self.create_publisher(Vector3Stamped, "/gimbal/state", 10)
+        # Health: True when the gimbal is actually commandable. For the TCP
+        # backend that means the single-client socket to the Z-1 Mini is
+        # connected (its lockout is the real failure mode); the sim backend
+        # is always healthy. Published at 1 Hz so consumers (sar_orchestrator
+        # → dashboard SAR card) can show a truthful gimbal dot.
+        self._pub_health = self.create_publisher(Bool, "/gimbal/health", 10)
+        self.create_timer(1.0, self._publish_health)
         self.create_subscription(
             PointStamped, "/gimbal/cmd/look_at_pixel", self._on_pixel_cmd, 50
         )
@@ -408,6 +416,11 @@ class GimbalControllerNode(Node):
             except Exception:
                 pass
             self._sock = None
+
+    def _publish_health(self):
+        b = Bool()
+        b.data = (self._backend != "tcp") or (self._sock is not None)
+        self._pub_health.publish(b)
 
     def _publish_state(self):
         m = Vector3Stamped()
