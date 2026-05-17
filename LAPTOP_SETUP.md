@@ -120,9 +120,26 @@ The dev PC produced `~/SkyResQ_laptop_bundle.tar.gz` containing:
 - `memory/` — the 13 Claude memory files (chat context)
 - `BUNDLE_README.txt` — restore steps (mirrors §4)
 
-Move it to the laptop by whatever's handy (USB stick, or over
-Tailscale once both machines are on the tailnet:
-`scp dev-pc:~/SkyResQ_laptop_bundle.tar.gz .`).
+Tailscale IPs (this tailnet):
+- dev PC : `100.93.242.103`
+- laptop : `100.79.221.88`
+- Pi     : `100.123.87.26`
+
+Move it to the laptop. The dev PC serves it over HTTP on the Tailscale
+interface (laptop SSH is closed, so pull, don't push):
+
+```bash
+# on the dev PC (one-time, short-lived):
+mkdir -p ~/.xfer && cp ~/SkyResQ_laptop_bundle.tar.gz ~/.xfer/
+cd ~/.xfer && python3 -m http.server 8742 --bind 0.0.0.0
+
+# on the laptop:
+cd ~ && curl -O http://100.93.242.103:8742/SkyResQ_laptop_bundle.tar.gz
+tar -xzf SkyResQ_laptop_bundle.tar.gz
+```
+
+Then stop the dev-PC server (Ctrl-C) — don't leave it running. USB
+stick is an equally fine offline alternative.
 
 ## Performance note (8 GB laptop)
 
