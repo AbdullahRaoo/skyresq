@@ -1,0 +1,91 @@
+<?xml version="1.0" ?>
+<!--
+  SAR demo world for the pixel-to-drop validation:
+  iris_with_gimbal (built-in 640x480 camera on a 3-axis gimbal) +
+  a textured standing-person model at +15 m N, well inside the
+  nadir camera's footprint at 20 m altitude (~62 m wide).
+
+  Spherical coords match the SITL home used elsewhere
+  (-35.363262, 149.165237), so geo_localiser's flat-earth around
+  /vehicle/home produces the same lat/lon system as bench runs.
+-->
+<sdf version="1.9">
+  <world name="sar_world">
+
+    <physics name="1ms" type="ignore">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system"        name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-sensors-system"        name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="gz-sim-user-commands-system"  name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-imu-system"            name="gz::sim::systems::Imu"/>
+    <plugin filename="gz-sim-navsat-system"         name="gz::sim::systems::NavSat"/>
+
+    <scene>
+      <ambient>1.0 1.0 1.0</ambient>
+      <background>0.8 0.85 0.95</background>
+      <sky/>
+    </scene>
+
+    <spherical_coordinates>
+      <latitude_deg>-35.363262</latitude_deg>
+      <longitude_deg>149.165237</longitude_deg>
+      <elevation>584</elevation>
+      <heading_deg>0</heading_deg>
+      <surface_model>EARTH_WGS84</surface_model>
+    </spherical_coordinates>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.9 0.9 0.9 1</diffuse>
+      <specular>0.5 0.5 0.5 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.3 0.1 -0.95</direction>
+    </light>
+
+    <!-- Large grass ground plane so the camera has something below. -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>200 200</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>200 200</size></plane></geometry>
+          <material>
+            <ambient>0.35 0.55 0.30 1</ambient>
+            <diffuse>0.35 0.55 0.30 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- The drone. Built-in camera on gimbal_small_3d (640x480, FOV 2.0 rad).
+         iris_with_gimbal yaw=90° = body forward points along +Y (north). -->
+    <include>
+      <uri>model://iris_with_gimbal</uri>
+      <pose degrees="true">0 0 0.195 0 0 90</pose>
+    </include>
+
+    <!-- Survivor: a textured human mesh at +15 m N. Camera at 20 m AGL
+         with HFOV ≈ 114° has a ground footprint ~62 m wide, so 15 m
+         is inside the frame from a hover at takeoff point. -->
+    <include>
+      <uri>https://fuel.gazebosim.org/1.0/OpenRobotics/models/Standing person</uri>
+      <name>survivor</name>
+      <pose>0 15 0 0 0 0</pose>
+    </include>
+
+  </world>
+</sdf>

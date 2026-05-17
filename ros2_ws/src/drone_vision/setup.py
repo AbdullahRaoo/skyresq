@@ -40,6 +40,7 @@ setup(
             'sar_orchestrator   = drone_vision.mission.sar_orchestrator:main',
             'sim_detection_injector = drone_vision.sim.sim_detection_injector:main',
             'sim_payload        = drone_vision.sim.sim_payload:main',
+            'sim_gimbal_state   = drone_vision.sim.sim_gimbal_state:main',
         ],
     },
 )

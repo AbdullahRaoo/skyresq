@@ -1,0 +1,16 @@
+# Gazebo iris_with_gimbal camera (gimbal_small_3d/model.sdf):
+#   width 640, height 480, horizontal_fov 2.0 rad (≈114.6°).
+# For an undistorted pinhole, fx = (width/2)/tan(hfov/2) = 320/tan(1.0).
+# This file is the geo_localiser intrinsics for the Gazebo pixel-to-drop
+# validation runs. It is NOT used in flight; the deployed Pi uses
+# camera_intrinsics_z1mini.yaml (calibrated separately) via the systemd
+# unit ExecStart.
+camera:
+  width:  640
+  height: 480
+  fx: 205.5
+  fy: 205.5
+  cx: 320.0
+  cy: 240.0
+  distortion_model: "plumb_bob"
+  D: [0.0, 0.0, 0.0, 0.0, 0.0]
