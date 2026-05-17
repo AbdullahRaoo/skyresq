@@ -9,7 +9,8 @@ Each phase is a gate: **do not proceed until the prior phase passes.**
 
 ## Phase 0 — Pre-flight bench prep (no flying)
 
-Blockers that MUST be closed before any autonomous geolocation is trustworthy:
+Blockers that MUST be closed before any autonomous geolocation is
+trustworthy. Items 1–3 are **coupled — fix as one change**, not piecemeal.
 
 1. **Camera calibration.** `ros2_ws/src/drone_vision/config/camera_intrinsics_z1mini.yaml`
    is a placeholder (`hfov_rad: 1.20 # CONFIRM`). Run a checkerboard
@@ -19,13 +20,22 @@ Blockers that MUST be closed before any autonomous geolocation is trustworthy:
    resolution; ensure `geo_localiser` `fx`/`cx` and `image_width/height`
    are all expressed in that same frame (audit found a 320 vs YAML-width
    mismatch — `frames.py` ray angles scale wrong otherwise).
-3. **Gimbal pitch-sign check.** With the new manual gimbal control
-   deployed, command pitch down from the dashboard and confirm
-   `/gimbal/state` reads ≈ **−90°** at nadir (`frames.py` expects
-   negative = down). If it reports +90, invert in `gimbal_controller`.
-4. **Attitude fusion (recommended).** `frames.py` body→world uses yaw
-   only; fold in roll/pitch from `/vehicle/attitude` (vector.x/y) or
-   accept large ground error whenever the drone is tilted.
+3. **Point the running node at the real intrinsics.** The deployed
+   geo_localiser is started by `ops/systemd/skyresq-geo-localiser.service`
+   with **no `--ros-args` overrides**, so it always loads the sim
+   defaults (`camera_intrinsics_sim.yaml`, 320x240) — verified in the
+   live startup banner. The `hardware.launch.py` edit does NOT affect the
+   service. Fix is in the **unit ExecStart** (mirror skyresq-mavlink-bridge:
+   `--ros-args -p intrinsics_file:=... -p image_width:=... -p image_height:=...`),
+   set together with the calibrated values from #1/#2.
+4. **Gimbal pitch-sign check.** With manual gimbal control deployed,
+   command pitch down from the dashboard and confirm `/gimbal/state`
+   reads ≈ **−90°** at nadir (`frames.py` expects negative = down). If it
+   reports +90, invert in `gimbal_controller`.
+5. **Attitude fusion.** ✅ DONE (commit 42416fe, deployed & running):
+   `frames.py` now uses the full Rz·Ry·Rx DCM; geo_localiser feeds
+   roll/pitch from `/vehicle/attitude`. Level flight is regression-
+   identical to the old yaw-only path.
 
 ## Phase 1 — Params & failsafes (bench, props off, RC on)
 
