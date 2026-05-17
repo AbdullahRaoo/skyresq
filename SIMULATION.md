@@ -14,7 +14,7 @@ verified on this development PC before any field flight.
 | Drop-point geometry | `compute_drop_point` (4 m short of survivor, drone-side) | ✅ exactly 31 m for a 35 m survivor (geometry correct) |
 | Payload contract | `sim_payload` mirrors `/payload/cmd` → `/payload/state` | ✅ DROP → DROP_HOLD only fires on payload-state echo |
 | GCS link path | TCP↔PTY bridge → `electron/mavlink.js` serial connect | ✅ heartbeat + 31 MAVLink msg types through `/tmp/ttySITL` |
-| Camera→world | (Gazebo phase — see below) | pending |
+| Camera→world | Gazebo + real YOLO `person_detector` → `geo_localiser` | ✅ survivor geo-located to ≈15 m N on rendered pixels; full pixel-to-drop run |
 
 **End-to-end run (latest):** detection injected at *t* = 46.2 s →
 `APPROACH` at 47.7 s with target distance **31.0 m** → `DROP` at 49.1 s
@@ -125,52 +125,61 @@ the optional Gazebo world + YOLO inference, which need this PC.
 The autonomy/dashboard/command validation that actually catches
 real bugs (as it just did) runs comfortably on the laptop.
 
-## Gazebo visual pipeline (this PC only — partial)
+## Gazebo visual pipeline (this PC only — ✅ VALIDATED 2026-05-18)
 
-All the pieces are built and individually verified; the only missing
-step is the end-to-end run, which hits an SITL `--model JSON`
-single-port-per-link constraint that fights a separate pilot client.
+Full **pixel-to-drop** chain proven end-to-end on Gazebo-rendered
+camera frames — real YOLO, not the injector:
 
-**Verified individually:**
-- `ardupilot_gazebo` plugin builds against gz-sim 8.11 (needs GStreamer
-  optionalised — patch lives in `~/ardupilot_gazebo/CMakeLists.txt`).
-- `ros2_ws/src/drone_vision/gazebo/sar_world.sdf` loads: iris_with_gimbal
-  + the OpenRobotics "Standing person" from Fuel at +15 m N + ground
-  plane, spherical coords at the standard SITL home.
-- ArduPilot ↔ Gazebo JSON handshake on UDP 9002 (`ArduPilot Ready`
-  status after a quick MAVLink wake-up on 5760).
-- gz↔ROS camera bridge publishing 640×480 frames to `/drone/camera_raw`
-  at **9.3 Hz**.
-- Gimbal direction controllable: needs the ArduPilot plugin's
-  channel-8/9/10 control blocks commented out in
-  `~/ardupilot_gazebo/models/iris_with_gimbal/model.sdf` (otherwise
-  servo PWM defaults overwrite our `/gimbal/cmd_pitch` at 50 Hz).
-- **The standing person is clearly visible in the rendered frame** —
-  saved at [docs/sim_evidence/gz_camera_sees_person.png](docs/sim_evidence/gz_camera_sees_person.png). YOLO will detect this.
+```
+IDLE → SEARCH → DETECTION_HOLD → APPROACH → DROP → DROP_HOLD → RTL → DONE
+```
 
-**What's blocking the end-to-end run:**
-- `arducopter --model JSON` only binds SERIAL0 (5760) by default;
-  SERIAL1/2 are not exposed, so the pilot script can't get its own
-  MAVLink stream without fighting `mavlink_bridge` for the same TCP
-  port (two clients → EOF/connection-reset thrashing).
-- Workarounds for next session: (a) pass `-A "--uartB tcp:5762"` to
-  arducopter to add a second TCP server, OR (b) write a tiny ROS node
-  that issues arm/takeoff via `mavlink_bridge`'s own connection
-  (publish to a new `/mission/cmd_arm` topic + extend the bridge to
-  handle it), OR (c) disable `FS_GCS_ENABLE` and have a one-shot pilot
-  arm+takeoff then disconnect, with `mavlink_bridge` reconnecting.
+- 52 real `person_detector` (YOLO) detections on the rendered camera.
+- `geo_localiser` placed the survivor at **(-35.36312, 149.16524)** —
+  **≈14–15 m N of home**, exactly matching the standing-person model
+  placed at +15 m N in the world (independent geo-math confirmation
+  on real pixels, not injected coordinates).
+- Drone **physically flew 11.9 m N** in Gazebo physics = the exact
+  drop-point geometry (15 m survivor − 4 m drone-side offset).
+- Payload OPEN → 3 s hold → CLOSE → RTL → DONE.
+- Evidence: [docs/sim_evidence/gazebo_pixel_to_drop_pass.log](docs/sim_evidence/gazebo_pixel_to_drop_pass.log)
+  and [docs/sim_evidence/gz_camera_sees_person.png](docs/sim_evidence/gz_camera_sees_person.png).
 
-**Run shells live at:**
-- `ros2_ws/src/drone_vision/gazebo/sar_world.sdf` — world
-- `ros2_ws/src/drone_vision/launch/sitl_gazebo.launch.py` — ROS stack
-- `ros2_ws/src/drone_vision/config/camera_intrinsics_gz.yaml` — intrinsics
-- `.bench/gz_run_all.sh` — orchestrated startup (one-shot pilot conflict
-  is the remaining issue)
+**One-command run:**
+```bash
+bash ros2_ws/src/drone_vision/gazebo/run_pixel_to_drop_sim.sh
+```
 
-The injector path in `sitl_core.launch.py` already proves the entire
-autonomy / command / FC / dashboard chain end-to-end. Gazebo adds the
-**pixel-to-world** stage on top — important for camera-pipeline
-confidence but not a gate on the autonomy itself.
+**One-time prereqs:**
+- `ardupilot_gazebo` plugin built at `~/ardupilot_gazebo/build`
+  (clone needs GStreamer made optional in its `CMakeLists.txt` — the
+  `pkg_check_modules(GST ...)` line drop `REQUIRED` + guard the
+  `GstCameraPlugin` target with `if(GST_FOUND)`).
+- In `~/ardupilot_gazebo/models/iris_with_gimbal/model.sdf`, comment
+  out the ArduPilot plugin's `<control channel="8|9|10">` blocks so the
+  gz `JointPositionController` owns `/gimbal/cmd_pitch` (otherwise the
+  servo PWM default overwrites the nadir command at 50 Hz).
+
+**Key non-obvious findings (baked into the runner):**
+- `arducopter --model JSON` must be given `--serial1 tcp:5762` so the
+  pilot has its own MAVLink stream — sharing 5760 with `mavlink_bridge`
+  causes EOF/connection-reset thrashing.
+- `gz topic /gimbal/cmd_pitch` needs **+1.57** (not −1.57) for nadir:
+  `gimbal_small_3d`'s camera pose chain is rotated so negative points
+  the camera at the drone's own underside.
+
+**Components:**
+- `gazebo/sar_world.sdf` — world (iris + standing person at +15 m N)
+- `gazebo/run_pixel_to_drop_sim.sh` — orchestrated one-command run
+- `gazebo/sitl_gz_pilot.py` — arm+takeoff pilot (SERIAL1)
+- `launch/sitl_gazebo.launch.py` — ROS stack (real detector + geo)
+- `config/camera_intrinsics_gz.yaml` — gz camera intrinsics
+- `drone_vision/sim/sim_gimbal_state.py` — static nadir `/gimbal/state`
+
+The injector path in `sitl_core.launch.py` proves the autonomy /
+command / FC / dashboard chain; this Gazebo path additionally proves
+the **camera → YOLO → geo_localiser → world** stage on real pixels.
+Both now pass.
 
 ## Cleanup
 
