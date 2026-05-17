@@ -63,6 +63,13 @@ def _R_pitch(rad):
     return ((c, 0.0, s), (0.0, 1.0, 0.0), (-s, 0.0, c))
 
 
+def _R_roll(rad):
+    """Rotation around body x (forward). Positive = right wing down
+    (ArduPilot ATTITUDE roll convention)."""
+    c, s = math.cos(rad), math.sin(rad)
+    return ((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c))
+
+
 # Optical frame → drone body frame (constant).
 # ROS optical: x=right, y=down, z=forward
 # PX4 body:    x=forward, y=right, z=down
@@ -84,7 +91,8 @@ def gimbal_to_body(yaw_g_rad, pitch_g_rad):
 
 def pixel_to_world_ray(u, v, fx, fy, cx, cy,
                        gimbal_yaw_deg, gimbal_pitch_deg,
-                       drone_yaw_rad):
+                       drone_yaw_rad,
+                       drone_roll_rad=0.0, drone_pitch_rad=0.0):
     """Return the unit ray (in NED) from the camera through pixel (u,v).
 
     Parameters
@@ -93,7 +101,9 @@ def pixel_to_world_ray(u, v, fx, fy, cx, cy,
     fx, fy     : focal lengths (px) — typically equal for square pixels
     cx, cy     : principal point (px) — image centre for an undistorted model
     gimbal_*   : gimbal angles (degrees) in body frame; pitch=-90 = nadir
-    drone_yaw_rad : drone yaw in NED (rotation around down axis)
+    drone_yaw_rad   : drone yaw in NED (rotation around down axis)
+    drone_roll_rad  : drone roll (body x). Default 0 = level (legacy).
+    drone_pitch_rad : drone pitch (body y). Default 0 = level (legacy).
 
     Returns
     -------
@@ -112,9 +122,14 @@ def pixel_to_world_ray(u, v, fx, fy, cx, cy,
     R_gb = gimbal_to_body(math.radians(gimbal_yaw_deg),
                           math.radians(gimbal_pitch_deg))
     r_body_drone = _matvec3(R_gb, r_body)
-    # Step 4: body → world (NED). We assume drone roll/pitch ≈ 0 (hover);
-    # only yaw matters. Good for SAR cruise; refine later if needed.
-    R_bw = _R_yaw(drone_yaw_rad)
+    # Step 4: body → world (NED) using the full drone attitude DCM
+    # R = Rz(yaw)·Ry(pitch)·Rx(roll) (aerospace ZYX / 3-2-1). Ignoring
+    # roll/pitch threw the ground hit off by tens of metres whenever the
+    # drone was tilted in cruise — the dominant geolocation error after
+    # camera calibration.
+    R_bw = _matmul3(_R_yaw(drone_yaw_rad),
+                    _matmul3(_R_pitch(drone_pitch_rad),
+                             _R_roll(drone_roll_rad)))
     r_world = _matvec3(R_bw, r_body_drone)
     # Normalise
     n = math.sqrt(r_world[0] ** 2 + r_world[1] ** 2 + r_world[2] ** 2)

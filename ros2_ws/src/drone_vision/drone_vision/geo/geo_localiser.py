@@ -89,6 +89,8 @@ class GeoLocaliser(Node):
         self.gimbal_pitch_deg = 0.0
         self.gimbal_age       = float('inf')
         self.drone_yaw_rad    = 0.0
+        self.drone_roll_rad   = 0.0
+        self.drone_pitch_rad  = 0.0
         self.drone_yaw_age    = float('inf')
         self.drone_pos_ned    = None   # (x, y, z) or None
         self.drone_pos_age    = float('inf')
@@ -163,8 +165,10 @@ class GeoLocaliser(Node):
         self.drone_pos_age = time.monotonic()
 
     def _on_attitude(self, msg: Vector3Stamped):
-        # vector.z = yaw in radians (published by mavlink_bridge / px4_adapter)
-        self.drone_yaw_rad = msg.vector.z
+        # mavlink_bridge publishes ATTITUDE as x=roll, y=pitch, z=yaw (rad).
+        self.drone_roll_rad  = msg.vector.x
+        self.drone_pitch_rad = msg.vector.y
+        self.drone_yaw_rad   = msg.vector.z
         self.drone_yaw_age = time.monotonic()
 
     def _on_home(self, msg: NavSatFix):
@@ -197,6 +201,7 @@ class GeoLocaliser(Node):
             u, v, self.fx, self.fy, self.cx, self.cy,
             self.gimbal_yaw_deg, self.gimbal_pitch_deg,
             self.drone_yaw_rad,
+            self.drone_roll_rad, self.drone_pitch_rad,
         )
         # Reject rays that don't head down enough — geometry blows up near
         # horizon and a 1° error becomes huge ground error.
