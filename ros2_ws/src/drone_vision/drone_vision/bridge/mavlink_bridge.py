@@ -163,6 +163,12 @@ class MavlinkBridgeNode(Node):
         # we don't saturate the 57600-baud serial.
         self._last_flyto_t = 0.0
         self._flyto_min_interval = 0.5  # 2 Hz max
+        # Track current AGL so fly_to can substitute it when the orchestrator
+        # passes NaN ("hold current altitude"). Sending alt=0+ignore-bit was
+        # version-fragile — some ArduCopter builds did honor the ignore-z bit,
+        # some commanded the copter toward alt=0 (ground). An explicit valid
+        # altitude with z-bit USED is what every reliable GUIDED path does.
+        self._current_relative_alt: float | None = None
 
         # ── Home state ─────────────────────────────────────────────────
         self._home_lat:   float | None = None
@@ -406,6 +412,7 @@ class MavlinkBridgeNode(Node):
         lon     = msg.lon / 1e7
         alt_msl = msg.alt / 1000.0
         agl     = msg.relative_alt / 1000.0   # metres AGL
+        self._current_relative_alt = agl
 
         stamp = self.get_clock().now().to_msg()
 
@@ -575,23 +582,36 @@ class MavlinkBridgeNode(Node):
         alt = float(msg.altitude)
         if not (lat or lon):
             return
-        # ArduPilot SET_POSITION_TARGET_GLOBAL_INT type_mask. We want to use
-        # ONLY position; tell FC to ignore vel (bits 3-5), accel (6-8), yaw
-        # (bit 10), yaw_rate (bit 11). DO NOT set bit 9 (FORCE_SET) — that
-        # would tell FC "treat accel fields as force commands" which is the
-        # wrong interpretation and was a silent bug previously.
-        # bits set: 3,4,5,6,7,8,10,11 = 8+16+32+64+128+256+1024+2048 = 0xDF8
+        # ArduPilot SET_POSITION_TARGET_GLOBAL_INT type_mask. We use the
+        # full position triple (x,y,z bits CLEAR) — every reliable GUIDED
+        # implementation does this. Tell FC to ignore vel (bits 3-5), accel
+        # (6-8), yaw (bit 10), yaw_rate (bit 11). DO NOT set bit 9 (FORCE).
+        # bits set: 3,4,5,6,7,8,10,11 = 0xDF8
         # ref: https://mavlink.io/en/messages/common.html#POSITION_TARGET_TYPEMASK
-        ignore_vel_accel_yaw = 0xDF8
-        type_mask = ignore_vel_accel_yaw
+        type_mask = 0xDF8
         if math.isnan(alt):
-            type_mask |= 0b100         # also ignore alt (bit 2) — hold current
-            alt = 0.0
+            # Orchestrator says "hold current altitude". Substitute the real
+            # current AGL with the z-bit USED (not the ignore-z trick). Some
+            # ArduCopter builds did not honor the ignore-altitude bit and
+            # commanded the copter toward alt=0 (ground) instead — confirmed
+            # in SITL when the approach drone never moved horizontally.
+            if self._current_relative_alt is None:
+                self.get_logger().warning(
+                    "fly_to: no current altitude yet, dropping setpoint"
+                )
+                return
+            alt = float(self._current_relative_alt)
+        # pymavlink's wait_heartbeat sets target_system but in 2.4.x sometimes
+        # leaves target_component=0 even when the autopilot's heartbeat is
+        # srcComp=1. ArduCopter doesn't filter SET_POSITION_TARGET by
+        # component, but DO_REPOSITION and others do — force the autopilot
+        # component (1) for every FC-bound command to be safe.
+        tgt_sys = self._mav.target_system
+        tgt_comp = self._mav.target_component or 1
         try:
             self._mav.mav.set_position_target_global_int_send(
                 0,                                  # time_boot_ms
-                self._mav.target_system,
-                self._mav.target_component,
+                tgt_sys, tgt_comp,
                 mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
                 type_mask,
                 int(lat * 1e7),
@@ -601,6 +621,13 @@ class MavlinkBridgeNode(Node):
                 0.0, 0.0, 0.0,    # acc x/y/z (ignored)
                 0.0, 0.0,         # yaw, yaw_rate (ignored)
             )
+            # Log first send + every 5 s so we can see it's actually firing.
+            if (now - getattr(self, "_last_flyto_log", 0.0)) > 5.0:
+                self.get_logger().info(
+                    f"fly_to → ({lat:.6f},{lon:.6f}) alt={alt:.1f}m "
+                    f"sys={tgt_sys} comp={tgt_comp}"
+                )
+                self._last_flyto_log = now
         except Exception as exc:
             self.get_logger().warning(f"fly_to send failed: {exc}")
 
