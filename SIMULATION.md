@@ -125,14 +125,52 @@ the optional Gazebo world + YOLO inference, which need this PC.
 The autonomy/dashboard/command validation that actually catches
 real bugs (as it just did) runs comfortably on the laptop.
 
-## Gazebo visual pipeline (max-fidelity, this PC only)
+## Gazebo visual pipeline (this PC only — partial)
 
-Pending. The pieces are wired (`sitl.launch.py` + `gz_bridge.yaml`
-already in `drone_vision/`) but the world + walking actor +
-ardupilot_gazebo plugin still need to be set up. The deterministic
-injector path above validates the entire autonomy/command/dashboard
-chain — Gazebo adds **camera→YOLO→geo_localiser** to that, not
-flight realism.
+All the pieces are built and individually verified; the only missing
+step is the end-to-end run, which hits an SITL `--model JSON`
+single-port-per-link constraint that fights a separate pilot client.
+
+**Verified individually:**
+- `ardupilot_gazebo` plugin builds against gz-sim 8.11 (needs GStreamer
+  optionalised — patch lives in `~/ardupilot_gazebo/CMakeLists.txt`).
+- `ros2_ws/src/drone_vision/gazebo/sar_world.sdf` loads: iris_with_gimbal
+  + the OpenRobotics "Standing person" from Fuel at +15 m N + ground
+  plane, spherical coords at the standard SITL home.
+- ArduPilot ↔ Gazebo JSON handshake on UDP 9002 (`ArduPilot Ready`
+  status after a quick MAVLink wake-up on 5760).
+- gz↔ROS camera bridge publishing 640×480 frames to `/drone/camera_raw`
+  at **9.3 Hz**.
+- Gimbal direction controllable: needs the ArduPilot plugin's
+  channel-8/9/10 control blocks commented out in
+  `~/ardupilot_gazebo/models/iris_with_gimbal/model.sdf` (otherwise
+  servo PWM defaults overwrite our `/gimbal/cmd_pitch` at 50 Hz).
+- **The standing person is clearly visible in the rendered frame** —
+  saved at [docs/sim_evidence/gz_camera_sees_person.png](docs/sim_evidence/gz_camera_sees_person.png). YOLO will detect this.
+
+**What's blocking the end-to-end run:**
+- `arducopter --model JSON` only binds SERIAL0 (5760) by default;
+  SERIAL1/2 are not exposed, so the pilot script can't get its own
+  MAVLink stream without fighting `mavlink_bridge` for the same TCP
+  port (two clients → EOF/connection-reset thrashing).
+- Workarounds for next session: (a) pass `-A "--uartB tcp:5762"` to
+  arducopter to add a second TCP server, OR (b) write a tiny ROS node
+  that issues arm/takeoff via `mavlink_bridge`'s own connection
+  (publish to a new `/mission/cmd_arm` topic + extend the bridge to
+  handle it), OR (c) disable `FS_GCS_ENABLE` and have a one-shot pilot
+  arm+takeoff then disconnect, with `mavlink_bridge` reconnecting.
+
+**Run shells live at:**
+- `ros2_ws/src/drone_vision/gazebo/sar_world.sdf` — world
+- `ros2_ws/src/drone_vision/launch/sitl_gazebo.launch.py` — ROS stack
+- `ros2_ws/src/drone_vision/config/camera_intrinsics_gz.yaml` — intrinsics
+- `.bench/gz_run_all.sh` — orchestrated startup (one-shot pilot conflict
+  is the remaining issue)
+
+The injector path in `sitl_core.launch.py` already proves the entire
+autonomy / command / FC / dashboard chain end-to-end. Gazebo adds the
+**pixel-to-world** stage on top — important for camera-pipeline
+confidence but not a gate on the autonomy itself.
 
 ## Cleanup
 
